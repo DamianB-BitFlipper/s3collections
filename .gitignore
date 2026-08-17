@@ -1,0 +1,11 @@
+# Binaries
+*.test
+*.out
+/dist/
+# Go
+/vendor/
+coverage.txt
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
