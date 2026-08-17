@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -32,9 +33,12 @@ type ChaosConfig struct {
 // Chaos wraps a Backend and injects transient errors, ambiguous write
 // outcomes, and latency. It is used by stress tests of every structure in
 // this module, and may be reused by consumers for their own chaos testing.
+// It is safe for concurrent use; injected randomness is serialized, which
+// only affects the statistical pattern, not the failure modes covered.
 type Chaos struct {
 	backend Backend
 	cfg     ChaosConfig
+	mu      sync.Mutex // guards rand (rand.Rand is not goroutine-safe)
 	rand    *rand.Rand
 }
 
@@ -47,13 +51,23 @@ func NewChaos(backend Backend, cfg ChaosConfig) *Chaos {
 	return &Chaos{backend: backend, cfg: cfg, rand: r}
 }
 
-func (c *Chaos) roll(p float64) bool { return p > 0 && c.rand.Float64() < p }
+func (c *Chaos) roll(p float64) bool {
+	if p <= 0 {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.rand.Float64() < p
+}
 
 func (c *Chaos) maybeDelay(ctx context.Context) error {
 	if !c.roll(c.cfg.DelayRate) || c.cfg.Delay <= 0 {
 		return nil
 	}
-	d := c.cfg.Delay/2 + time.Duration(c.rand.Int63n(int64(c.cfg.Delay/2)+1))
+	c.mu.Lock()
+	jitter := c.rand.Int63n(int64(c.cfg.Delay/2) + 1)
+	c.mu.Unlock()
+	d := c.cfg.Delay/2 + time.Duration(jitter)
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
@@ -66,7 +80,10 @@ func (c *Chaos) maybeDelay(ctx context.Context) error {
 
 func (c *Chaos) injectError(op, key string) error {
 	code, status := "InternalError", 500
-	if c.rand.Intn(2) == 0 {
+	c.mu.Lock()
+	flip := c.rand.Intn(2)
+	c.mu.Unlock()
+	if flip == 0 {
 		code, status = "SlowDown", 503
 	}
 	return &Error{Op: op, Key: key, StatusCode: status, Code: code,
