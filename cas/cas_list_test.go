@@ -2,6 +2,9 @@ package cas
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -168,5 +171,167 @@ func TestGC(t *testing.T) {
 	// Tombstoned records can now be recreated.
 	if _, err := s.Create(ctx, indexKey(0), []byte("new")); err != nil {
 		t.Fatalf("recreate after gc: %v", err)
+	}
+}
+
+func TestListLargePagination(t *testing.T) {
+	ctx := context.Background()
+	s, err := New(s3backend.NewMemory(), "biglist/")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed ~2500 keys across nested prefixes to exercise pagination and
+	// prefix encoding through the strict-token Memory backend.
+	const (
+		totalKeys = 2500
+		pageSize  = 10
+	)
+	want := make(map[string]struct{}, totalKeys)
+	for i := 0; i < totalKeys; i++ {
+		var prefix string
+		switch i % 4 {
+		case 0:
+			prefix = "a/"
+		case 1:
+			prefix = "a/b/"
+		case 2:
+			prefix = "a/b/c/"
+		case 3:
+			prefix = "z/"
+		}
+		k := fmt.Sprintf("%skey-%04d", prefix, i)
+		if _, err := s.Create(ctx, k, []byte("v")); err != nil {
+			t.Fatalf("create %s: %v", k, err)
+		}
+		want[k] = struct{}{}
+	}
+
+	// Page through the entire store using the backend continuation tokens.
+	seen := make(map[string]struct{})
+	tok := ""
+	pages := 0
+	for {
+		page, err := s.List(ctx, &ListOptions{ContinuationToken: tok, MaxKeys: pageSize})
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		pages++
+		for _, r := range page.Records {
+			if _, ok := seen[r.Key]; ok {
+				t.Fatalf("key %q seen twice", r.Key)
+			}
+			seen[r.Key] = struct{}{}
+		}
+		if !page.IsTruncated {
+			break
+		}
+		tok = page.NextContinuationToken
+		if tok == "" {
+			t.Fatal("truncated but no token")
+		}
+	}
+	if len(seen) != totalKeys {
+		t.Fatalf("expected %d keys, got %d", totalKeys, len(seen))
+	}
+	if pages < totalKeys/pageSize {
+		t.Fatalf("expected at least %d pages, got %d", totalKeys/pageSize, pages)
+	}
+
+	// Prefix "a/b/" should be listable and return only its descendants.
+	seenPrefix := make(map[string]struct{})
+	tok = ""
+	for {
+		page, err := s.List(ctx, &ListOptions{Prefix: "a/b/", ContinuationToken: tok, MaxKeys: pageSize})
+		if err != nil {
+			t.Fatalf("list prefix: %v", err)
+		}
+		for _, r := range page.Records {
+			if !strings.HasPrefix(r.Key, "a/b/") {
+				t.Fatalf("key %q does not match prefix a/b/", r.Key)
+			}
+			seenPrefix[r.Key] = struct{}{}
+		}
+		if !page.IsTruncated {
+			break
+		}
+		tok = page.NextContinuationToken
+	}
+	wantPrefixCount := 0
+	for k := range want {
+		if strings.HasPrefix(k, "a/b/") {
+			wantPrefixCount++
+		}
+	}
+	if len(seenPrefix) != wantPrefixCount {
+		t.Fatalf("expected %d keys under a/b/, got %d", wantPrefixCount, len(seenPrefix))
+	}
+}
+
+func TestListInvalidContinuationToken(t *testing.T) {
+	ctx := context.Background()
+	s, err := New(s3backend.NewMemory(), "tok/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(ctx, "k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	// A garbage continuation token must fail cleanly (error, not panic).
+	_, err = s.List(ctx, &ListOptions{ContinuationToken: "not-a-token", MaxKeys: 1})
+	if err == nil {
+		t.Fatal("expected error for garbage continuation token")
+	}
+	if !errors.Is(err, s3backend.ErrNotFound) {
+		// s3backend.Memory returns a non-retryable s3backend.Error; ensure
+		// it is propagated rather than swallowed.
+		var s3err *s3backend.Error
+		if !errors.As(err, &s3err) {
+			t.Fatalf("expected *s3backend.Error, got %T: %v", err, err)
+		}
+		if s3err.Code != "InvalidContinuationToken" {
+			t.Fatalf("expected InvalidContinuationToken, got %s", s3err.Code)
+		}
+	}
+}
+
+func TestListContinuationTokenIsNotSynthesizedFromKey(t *testing.T) {
+	ctx := context.Background()
+	s, err := New(s3backend.NewMemory(), "tokshape/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := s.Create(ctx, indexKey(i), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Regression: the returned token must be the opaque backend token, not
+	// the raw object key. We verify by checking that the token has the
+	// backend-issued prefix and that paging proceeds without an
+	// InvalidContinuationToken error.
+	page, err := s.List(ctx, &ListOptions{MaxKeys: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.IsTruncated {
+		t.Fatal("expected truncated page")
+	}
+	if page.NextContinuationToken == "" {
+		t.Fatal("expected continuation token")
+	}
+	if !strings.HasPrefix(page.NextContinuationToken, "ctok-v1.") {
+		t.Fatalf("expected opaque backend token, got %q", page.NextContinuationToken)
+	}
+
+	// Resuming with the token must succeed.
+	page2, err := s.List(ctx, &ListOptions{ContinuationToken: page.NextContinuationToken, MaxKeys: 2})
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if len(page2.Records) == 0 {
+		t.Fatal("expected records on resumed page")
 	}
 }

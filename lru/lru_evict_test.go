@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/damianb/s3collections"
+	"github.com/damianb/s3collections/cas"
 	"github.com/damianb/s3collections/s3backend"
 )
 
@@ -228,5 +229,88 @@ func TestTombstoneGC(t *testing.T) {
 	_, err = store.Get(ctx, key)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound after GC, got %v", err)
+	}
+}
+
+func TestEvictorPagination(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	meter := s3collections.NewCaptureMeter()
+	store, err := New(s3backend.NewMemory(), Options{
+		Prefix:           "lru/",
+		ShardCount:       1,
+		CapacityItems:    2,
+		EvictorInterval:  25 * time.Millisecond,
+		EvictorWorkers:   1,
+		EvictorBatchSize: 10,
+		ListPageSize:     10,
+		Meter:            meter,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer store.Close()
+	if err := store.StartEvictor(ctx); err != nil {
+		t.Fatalf("StartEvictor: %v", err)
+	}
+
+	const n = 100
+	for i := 0; i < n; i++ {
+		meta := EntryMeta{SizeBytes: 100, CreatedAt: time.Now(), LastAccessAt: time.Now(), AccessCount: 1}
+		if err := store.Set(ctx, fmt.Sprintf("key-%04d", i), meta); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+
+	// The evictor must page through the shard (more than one list page) and
+	// eventually evict all but one entry.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st, err := store.Stats(ctx)
+		if err != nil {
+			t.Fatalf("Stats: %v", err)
+		}
+		if st.ApproxItems <= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("evictor did not converge, %d items remain", st.ApproxItems)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if meter.CounterSum(metricListPages) < 2 {
+		t.Fatalf("expected multiple list pages, got %v", meter.CounterSum(metricListPages))
+	}
+	if meter.CounterSum(metricEvictions) < n-2 {
+		t.Fatalf("expected at least %d evictions, got %v", n-2, meter.CounterSum(metricEvictions))
+	}
+}
+
+func TestEvictorRejectsInvalidContinuationToken(t *testing.T) {
+	ctx := context.Background()
+	store, err := New(s3backend.NewMemory(), Options{
+		Prefix:     "lru/",
+		ShardCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer store.Close()
+
+	// The evictor uses cas.List under the hood. A garbage continuation token
+	// must be returned as an error by cas.List, not panic.
+	_, err = store.cas.List(ctx, &cas.ListOptions{
+		Prefix:            "entries/0/",
+		ContinuationToken: "garbage-token",
+		MaxKeys:           1,
+	})
+	if err == nil {
+		t.Fatal("expected error for garbage continuation token")
+	}
+	var s3err *s3backend.Error
+	if !errors.As(err, &s3err) || s3err.Code != "InvalidContinuationToken" {
+		t.Fatalf("expected InvalidContinuationToken error, got %v", err)
 	}
 }

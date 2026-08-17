@@ -75,14 +75,13 @@ const (
 
 // metric names.
 const (
-	metricLatency    = "s3collections_latency_seconds"
-	metricAttempts   = "s3collections_cas_attempts"
-	metricConflicts  = "s3collections_conflicts_total"
-	metricRetries    = "s3collections_retries_total"
-	metricListPages  = "s3collections_list_pages_total"
-	metricCorrupt    = "s3collections_corrupt_total"
-	componentValue   = "cas"
-	prefixLabelValue = "cas"
+	metricLatency   = "s3collections_latency_seconds"
+	metricAttempts  = "s3collections_cas_attempts"
+	metricConflicts = "s3collections_conflicts_total"
+	metricRetries   = "s3collections_retries_total"
+	metricListPages = "s3collections_list_pages_total"
+	metricCorrupt   = "s3collections_corrupt_total"
+	componentValue  = "cas"
 )
 
 func labels(kv ...string) []s3collections.Label {
@@ -110,8 +109,8 @@ func (s *Store) recordRetry(ctx context.Context, op opName, reason string) {
 	s.opts.Meter.IncCounter(ctx, metricRetries, 1, labels("component", componentValue, "op", string(op), "reason", reason)...)
 }
 
-func (s *Store) recordListPage(ctx context.Context) {
-	s.opts.Meter.IncCounter(ctx, metricListPages, 1, labels("component", componentValue, "op", string(opList), "prefix", prefixLabelValue)...)
+func (s *Store) recordListPage(ctx context.Context, prefix string) {
+	s.opts.Meter.IncCounter(ctx, metricListPages, 1, labels("component", componentValue, "op", string(opList), "prefix", prefix)...)
 }
 
 func (s *Store) recordCorrupt(ctx context.Context) {

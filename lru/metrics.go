@@ -35,13 +35,18 @@ const (
 	metricListPages   = "s3collections_list_pages_total"
 	metricCorrupt     = "s3collections_corrupt_total"
 
-	componentValue      = "lru"
-	labelKind           = "kind"
-	labelReason         = "reason"
-	retryReasonConflict = "conflict"
+	componentValue = "lru"
+	labelKind      = "kind"
+	labelReason    = "reason"
 
 	kindLive      = "live"
 	kindTombstone = "tombstone"
+)
+
+// retryReason values for s3collections_retries_total.
+const (
+	retryReasonConflict = "conflict"
+	retryReasonBackend  = "backend"
 )
 
 const (

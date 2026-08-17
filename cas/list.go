@@ -3,6 +3,7 @@ package cas
 import (
 	"context"
 	"errors"
+	"net/url"
 	"strings"
 	"time"
 
@@ -31,6 +32,43 @@ type GCOptions struct {
 	MaxDeletes int
 }
 
+// encodeListPrefix maps an application-level prefix to a backend object-key
+// prefix. To keep listing correct and prefix-safe, we encode complete path
+// segments only and truncate at a segment boundary when the prefix ends mid-
+// segment. The caller must still filter decoded keys as a safety belt.
+func (s *Store) encodeListPrefix(prefix string) string {
+	if prefix == "" {
+		return s.prefix
+	}
+	segments := strings.Split(prefix, "/")
+	// If the prefix does not end with '/', the last segment is partial; drop
+	// it and list from the previous segment boundary. This is conservative:
+	// it may return false positives, but never misses a true match.
+	if !strings.HasSuffix(prefix, "/") {
+		segments = segments[:len(segments)-1]
+	}
+	escaped := make([]string, 0, len(segments))
+	for _, seg := range segments {
+		if seg == "" {
+			continue
+		}
+		escaped = append(escaped, url.PathEscape(seg))
+	}
+	if len(escaped) == 0 {
+		return s.prefix
+	}
+	return s.prefix + strings.Join(escaped, "/") + "/"
+}
+
+// encodeListStartAfter maps an application start-after key to a backend
+// object key (including the store prefix and .cas.v1.json suffix).
+func (s *Store) encodeListStartAfter(startAfter string) (string, error) {
+	if startAfter == "" {
+		return "", nil
+	}
+	return s.objectKey(startAfter)
+}
+
 // List returns records (including tombstones) whose keys begin with Prefix.
 func (s *Store) List(ctx context.Context, opts *ListOptions) (*ListPage, error) {
 	start := time.Now()
@@ -38,20 +76,27 @@ func (s *Store) List(ctx context.Context, opts *ListOptions) (*ListPage, error) 
 		opts = &ListOptions{}
 	}
 
-	// We list everything under the store prefix and filter decoded application
-	// keys. This avoids ambiguous prefix encoding around path separators.
+	backendPrefix := s.encodeListPrefix(opts.Prefix)
 	bopts := &s3backend.ListOptions{
-		StartAfter:        "",
 		ContinuationToken: opts.ContinuationToken,
 		MaxKeys:           opts.MaxKeys,
 	}
+	// ContinuationToken takes precedence over StartAfter, matching S3 semantics.
+	if opts.ContinuationToken == "" && opts.StartAfter != "" {
+		startAfter, err := s.encodeListStartAfter(opts.StartAfter)
+		if err != nil {
+			s.observeLatency(ctx, opList, start, outcomeError)
+			return nil, err
+		}
+		bopts.StartAfter = startAfter
+	}
 
-	page, err := s.backend.List(ctx, s.prefix, bopts)
+	page, err := s.backend.List(ctx, backendPrefix, bopts)
 	if err != nil {
 		s.observeLatency(ctx, opList, start, outcomeError)
 		return nil, classifyError(opList, err)
 	}
-	s.recordListPage(ctx)
+	s.recordListPage(ctx, "cas/store-root")
 
 	records := make([]Record, 0, len(page.Objects))
 	for _, info := range page.Objects {
@@ -84,11 +129,9 @@ func (s *Store) List(ctx context.Context, opts *ListOptions) (*ListPage, error) 
 	}
 
 	out := &ListPage{
-		Records:     records,
-		IsTruncated: page.IsTruncated,
-	}
-	if page.IsTruncated && len(page.Objects) > 0 {
-		out.NextContinuationToken = page.Objects[len(page.Objects)-1].Key
+		Records:               records,
+		IsTruncated:           page.IsTruncated,
+		NextContinuationToken: page.NextContinuationToken,
 	}
 	s.observeLatency(ctx, opList, start, outcomeSuccess)
 	return out, nil

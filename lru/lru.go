@@ -5,9 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -402,6 +400,9 @@ func (s *Store) Close() error {
 }
 
 // retry executes op with the store retry policy, recording retries and conflicts.
+// Retries are classified by reason: "conflict" for CAS conflicts (412 /
+// ErrConflict) and "backend" for transient *s3backend.Error values.
+// ErrAlreadyExists is treated as a terminal conflict and is not retried.
 func (s *Store) retry(ctx context.Context, op opName, opFn func(context.Context) error) error {
 	policy := s.opts.Retry
 	nextDelay := s3collections.BackoffDelays(policy, nil)
@@ -413,15 +414,19 @@ func (s *Store) retry(ctx context.Context, op opName, opFn func(context.Context)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if errors.Is(err, cas.ErrConflict) {
+		if errors.Is(err, cas.ErrConflict) || errors.Is(err, cas.ErrAlreadyExists) {
 			s.recordConflict(ctx, op)
 		}
-		if !errors.Is(err, cas.ErrConflict) && !s3backend.IsRetryable(err) {
+		var retryReason string
+		switch {
+		case errors.Is(err, cas.ErrConflict):
+			retryReason = retryReasonConflict
+		case s3backend.IsRetryable(err):
+			retryReason = retryReasonBackend
+		default:
 			return err
 		}
-		if errors.Is(err, cas.ErrConflict) || s3backend.IsRetryable(err) {
-			s.recordRetry(ctx, op, retryReasonConflict)
-		}
+		s.recordRetry(ctx, op, retryReason)
 		if attempt == policy.MaxAttempts {
 			return err
 		}
@@ -432,33 +437,4 @@ func (s *Store) retry(ctx context.Context, op opName, opFn func(context.Context)
 		}
 	}
 	return nil
-}
-
-const casObjectSuffix = ".cas.v1.json"
-
-// decodeObjectKey reverses the default cas key codec for an object under this
-// store. It is used by the evictor to turn backend object keys back into the
-// application keys that cas understands.
-func (s *Store) decodeObjectKey(objectKey string) (string, error) {
-	if !strings.HasPrefix(objectKey, s.opts.Prefix) {
-		return "", fmt.Errorf("lru: object key %q outside store prefix", objectKey)
-	}
-	encoded := strings.TrimPrefix(objectKey, s.opts.Prefix)
-	if !strings.HasSuffix(encoded, casObjectSuffix) {
-		return "", fmt.Errorf("lru: object key %q missing cas suffix", objectKey)
-	}
-	base := strings.TrimSuffix(encoded, casObjectSuffix)
-	segments := strings.Split(base, "/")
-	out := make([]string, len(segments))
-	for i, seg := range segments {
-		d, err := url.PathUnescape(seg)
-		if err != nil {
-			return "", err
-		}
-		if d == "" {
-			return "", fmt.Errorf("lru: empty decoded segment")
-		}
-		out[i] = d
-	}
-	return strings.Join(out, "/"), nil
 }

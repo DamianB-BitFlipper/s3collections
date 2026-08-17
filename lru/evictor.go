@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/damianb/s3collections"
 	"github.com/damianb/s3collections/cas"
 	"github.com/damianb/s3collections/s3backend"
 )
@@ -71,13 +72,38 @@ func jitteredDelay(rnd *rand.Rand, interval time.Duration) time.Duration {
 	return time.Duration(rnd.Float64() * float64(interval))
 }
 
-// shardPage is the result of listing one page of a shard directly from the
-// backend. Using the backend avoids the global-store pagination that
-// cas.List performs.
-type shardPage struct {
-	Records               []cas.Record
-	IsTruncated           bool
-	NextContinuationToken string
+// appKeyPrefix returns the cas application-key prefix for a shard.
+func (s *Store) appKeyPrefix(shard int) string {
+	return fmt.Sprintf("entries/%s/", s.shardStr(shard))
+}
+
+// withBackendRetry executes op with bounded retries on transient backend
+// errors, emitting s3collections_retries_total{component="lru",op,reason="backend"}.
+func (s *Store) withBackendRetry(ctx context.Context, op opName, opFn func(context.Context) error) error {
+	policy := s.opts.Retry
+	nextDelay := s3collections.BackoffDelays(policy, nil)
+	for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
+		err := opFn(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !s3backend.IsRetryable(err) {
+			return err
+		}
+		s.recordRetry(ctx, op, retryReasonBackend)
+		if attempt == policy.MaxAttempts {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(nextDelay()):
+		}
+	}
+	return nil
 }
 
 // processShard runs one CLOCK eviction pass over a single shard.
@@ -127,6 +153,11 @@ func (s *Store) processShard(ctx context.Context, shard, tick int) {
 			continue
 		}
 
+		// Stale/orphan heuristic: entries that were never accessed and were
+		// created well before the evictor interval are assumed to be orphans
+		// left by a crashed writer. Wall-clock skew is tolerated because the
+		// threshold is several evictor intervals old; a small amount of skew
+		// only shifts the cleanup by a single tick.
 		stale := e.M.AccessCount == 0 && !e.M.CreatedAt.IsZero() && now.Sub(e.M.CreatedAt) > 2*s.opts.EvictorInterval
 		if stale {
 			if s.evictRecord(ctx, rec, "stale", false, 0, time.Time{}) {
@@ -138,7 +169,14 @@ func (s *Store) processShard(ctx context.Context, shard, tick int) {
 
 		if e.Access {
 			// First pass: clear the access bit.
-			_ = s.clearAccess(ctx, rec, e, now)
+			if err := s.clearAccess(ctx, rec, e, now); err != nil {
+				// Best-effort: log transient backend errors and emit a retry
+				// metric, but do not abort the pass.
+				if s3backend.IsRetryable(err) {
+					s.recordRetry(ctx, opEvict, retryReasonBackend)
+				}
+				s.opts.Logger.Warn(err, "lru: clear access failed", "shard", shard, "key", rec.Key)
+			}
 			continue
 		}
 
@@ -164,7 +202,10 @@ func (s *Store) processShard(ctx context.Context, shard, tick int) {
 		s.setCursor(shard, "")
 	}
 
-	// Update approximate gauges.
+	// Update approximate gauges. These are best-effort estimates because
+	// concurrent writers may add or remove entries between the usage scan
+	// and this point; the tombstone gauge in particular counts freed items
+	// that may not yet be physically deleted.
 	s.setGauge(ctx, metricEntries, float64(liveItems-freedItems), labelKind, kindLive)
 	s.setGauge(ctx, metricEntries, float64(tombstones+freedItems), labelKind, kindTombstone)
 	s.setGauge(ctx, metricBytes, float64(liveBytes-freedBytes))
@@ -181,69 +222,47 @@ func (s *Store) processShard(ctx context.Context, shard, tick int) {
 	}
 }
 
-// listShard pages the backend directly for objects under the shard prefix.
-// The continuation token is a backend object key, which avoids the global
-// pagination issues of cas.List.
-func (s *Store) listShard(ctx context.Context, shard int, continuation string) (shardPage, error) {
-	prefix := s.opts.Prefix + fmt.Sprintf("entries/%s/", s.shardStr(shard))
-	opts := &s3backend.ListOptions{
-		ContinuationToken: continuation,
-		MaxKeys:           pageSize(s.opts.EvictorBatchSize),
-	}
-	page, err := s.backend.List(ctx, prefix, opts)
+// listShard pages one shard using cas.Store.List. We use the cas List API
+// rather than direct backend paging so that key encoding/decoding stays
+// encapsulated in the cas package; the paging cost is equivalent because
+// both paths perform one LIST and one GET per object.
+func (s *Store) listShard(ctx context.Context, shard int, continuation string) (*cas.ListPage, error) {
+	var page *cas.ListPage
+	err := s.withBackendRetry(ctx, opEvict, func(ctx context.Context) error {
+		var err error
+		page, err = s.cas.List(ctx, &cas.ListOptions{
+			Prefix:            s.appKeyPrefix(shard),
+			ContinuationToken: continuation,
+			MaxKeys:           pageSize(s.opts.EvictorBatchSize),
+		})
+		return err
+	})
 	if err != nil {
-		return shardPage{}, err
+		return nil, err
 	}
 	s.incCounter(ctx, metricListPages, 1, "op", "list", "prefix", "lru/entries/<shard>/")
-
-	records := make([]cas.Record, 0, len(page.Objects))
-	for _, info := range page.Objects {
-		appKey, err := s.decodeObjectKey(info.Key)
-		if err != nil {
-			s.incCounter(ctx, metricCorrupt, 1)
-			continue
-		}
-		rec, err := s.cas.GetMeta(ctx, appKey)
-		if err != nil {
-			s.incCounter(ctx, metricCorrupt, 1)
-			continue
-		}
-		records = append(records, rec)
-	}
-
-	out := shardPage{
-		Records:     records,
-		IsTruncated: page.IsTruncated,
-	}
-	if page.IsTruncated && len(page.Objects) > 0 {
-		out.NextContinuationToken = page.Objects[len(page.Objects)-1].Key
-	}
-	return out, nil
+	return page, nil
 }
 
 // shardUsage returns live count, tombstone count, and live bytes for a shard.
 func (s *Store) shardUsage(ctx context.Context, shard int) (int64, int64, int64, error) {
-	prefix := s.opts.Prefix + fmt.Sprintf("entries/%s/", s.shardStr(shard))
 	var live, tomb, bytes int64
 	token := ""
 	for {
-		page, err := s.backend.List(ctx, prefix, &s3backend.ListOptions{
-			ContinuationToken: token,
-			MaxKeys:           pageSize(s.opts.ListPageSize),
+		var page *cas.ListPage
+		err := s.withBackendRetry(ctx, opEvict, func(ctx context.Context) error {
+			var err error
+			page, err = s.cas.List(ctx, &cas.ListOptions{
+				Prefix:            s.appKeyPrefix(shard),
+				ContinuationToken: token,
+				MaxKeys:           pageSize(s.opts.ListPageSize),
+			})
+			return err
 		})
-		s.incCounter(ctx, metricListPages, 1, "op", "list", "prefix", "lru/entries/<shard>/")
 		if err != nil {
 			return 0, 0, 0, err
 		}
-		for _, info := range page.Objects {
-			appKey, err := s.decodeObjectKey(info.Key)
-			if err != nil {
-				continue
-			}
-			rec, err := s.cas.GetMeta(ctx, appKey)
-			if err != nil {
-				continue
-			}
+		for _, rec := range page.Records {
 			switch rec.State {
 			case cas.Live:
 				live++

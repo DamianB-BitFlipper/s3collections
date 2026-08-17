@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -177,7 +178,7 @@ type bytesReader struct {
 
 func (r *bytesReader) Read(p []byte) (int, error) {
 	if r.i >= len(r.b) {
-		return 0, errors.New("EOF")
+		return 0, io.EOF
 	}
 	n := copy(p, r.b[r.i:])
 	r.i += n
