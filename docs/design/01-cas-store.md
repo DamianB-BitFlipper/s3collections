@@ -84,7 +84,7 @@ type UpdateFn func(ctx context.Context, cur Record) (next []byte, err error)
 type Store struct { /* internal fields */ }
 
 // New creates a Store targeting a bucket and prefix. Prefix may be empty or end with '/'.
-func New(b Backend, bucket, prefix string, opts ...Option) (*Store, error)
+func New(b s3backend.Backend, bucket, prefix string, opts ...Option) (*Store, error) // b from package s3backend
 
 // Create creates a new key if and only if it does not exist at all (no object, not even a tombstone).
 // On success returns the created live record (revision==1). If a tombstone or live object exists, returns ErrAlreadyExists.
@@ -94,42 +94,49 @@ func (s *Store) Create(ctx context.Context, key string, value []byte, opts ...Wr
 // If tombstoned, the returned error will satisfy errors.As(err, *NotFoundError) with Tombstoned=true and last Revision.
 func (s *Store) Get(ctx context.Context, key string) (Record, error)
 
-// GetMeta returns metadata even for tombstones. Missing keys return ErrNotFound with Tombstoned=false.
+// GetMeta returns metadata even for tombstones. Missing keys return ErrNotFound (NotFoundError with Tombstoned=false).
 func (s *Store) GetMeta(ctx context.Context, key string) (Record, error)
 
 // CompareAndSwap replaces the value iff the current state is Live and its Revision==expect.
-// If the key is tombstoned, returns ErrDeleted. If revisions mismatch, returns ErrConflict.
+// Implementation: GET current (to obtain ETag and Revision), check Revision==expect, then PUT with If-Match: <ETag>.
+// If the key is tombstoned, returns ErrDeleted. If revisions mismatch, returns ErrConflict before PUT.
 func (s *Store) CompareAndSwap(ctx context.Context, key string, expect uint64, newValue []byte, opts ...WriteOption) (Record, error)
 
 // Update performs a read-modify-write loop calling fn, retrying on conflicts with backoff.
+// If fn returns a byte slice equal to the current Value and makes no state change, Update short-circuits and
+// returns the current Record without performing a PUT (no-op). Equality is byte-for-byte.
 // If the key is tombstoned, fn is not invoked and ErrDeleted is returned unless IncludeTombstone was set in opts.
 // When IncludeTombstone is true, fn is invoked with a tombstone Record, but any attempt to write a live value results in ErrDeleted.
 // This preserves the invariant that re-creation is blocked while tombstone exists (see §4 Resurrections).
 func (s *Store) Update(ctx context.Context, key string, fn UpdateFn, opts ...WriteOption) (Record, error)
 
 // Delete marks the key with a tombstone (state->Tombstone), incrementing the revision.
-// - If the key is Live and expect==current revision, write tombstone and return the tombstone Record.
-// - If the key is Tombstone, the operation is idempotent: returns the current tombstone Record.
+// Semantics:
+// - If the key is Live and expect==current live revision, write tombstone (rev=liveRev+1) and return it.
+// - If the key is Tombstone (rev=tombRev):
+//     * If expect==tombRev OR expect==tombRev-1 (the live revision used to delete), succeed idempotently and return the tombstone without writing.
+//     * Else: ErrConflict (stale token).
 // - If the key is missing: ErrNotFound.
-// - If expect mismatches: ErrConflict.
+// - Any other revision mismatch when Live: ErrConflict.
 func (s *Store) Delete(ctx context.Context, key string, expect uint64, opts ...WriteOption) (Record, error)
 
 // Retry is a helper to apply the given policy around an arbitrary operation, classifying conflicts, 5xx, and throttling.
 func Retry(ctx context.Context, policy RetryPolicy, op func(context.Context) error) error
 
-// IsConflict returns true if err indicates a CAS conflict (412 Precondition Failed or ErrConflict).
+// IsConflict returns true iff err classifies as a CAS conflict (use errors.Is(err, ErrConflict)).
+// Create's 412 (If-None-Match) maps to ErrAlreadyExists and should NOT be treated as a conflict.
 func IsConflict(err error) bool
 
 // Notes on Delete idempotence and conflicts:
-// - Delete requires the caller to pass the current revision. If the object is already a tombstone,
-//   Delete succeeds only when expect==current tombstone revision; otherwise ErrConflict.
+// - Delete requires the caller to pass the observed revision. If the object is already a tombstone
+//   at rev R, Delete is idempotent when expect==R or expect==R-1 (the prior live revision). Otherwise ErrConflict.
 //   This preserves fencing and detects stale callers.
 
 // Options and per-call overrides.
 
 type Options struct {
     WriterID       string        // included in envelopes for observability.
-    MaxValueBytes  int           // default 256*1024. Hard cap for single-object PUTs; no multipart used.
+    MaxValueBytes  int           // default 256*1024 (256 KiB). Hard cap for single-object PUTs; no multipart.
     Retry          RetryPolicy   // default backoff policy; may be overridden per call.
     Hooks          Hooks         // optional observability callbacks.
     ClockSkewHint  time.Duration // only for GC/timestamp safety margins; 0->default 2m
@@ -141,7 +148,6 @@ type Option func(*Options)
 type WriteOptions struct {
     Retry            *RetryPolicy // overrides Store default
     IncludeTombstone bool         // see Update semantics
-    IfUnchangedETag  string       // expert: adds an extra If-Match to the CAS PUT in addition to revision guards
 }
 
 type WriteOption func(*WriteOptions)
@@ -177,7 +183,7 @@ Notes:
 
 - The envelope contains a `rev` field, a monotonically increasing uint64. First creation sets `rev=1`.
 - Every successful state change (CAS/Update/Delete) sets `rev=prev+1`.
-- All writes are guarded by S3's If-Match on the currently observed ETag to ensure atomicity of the envelope write. The envelope's `rev` is checked by the library prior to writing to avoid silent divergence but is not used as the server-side precondition.
+- All writes are guarded by S3's If-Match on the last observed ETag to ensure atomicity of the envelope write. The envelope's `rev` is checked by the library prior to writing to avoid silent divergence but is not used as the server-side precondition.
 - Clients observe `Revision` in API results. This value is stable across backends and encodings and is appropriate as a fencing token in higher layers such as queue claim tokens or LRU epoch markers.
 
 Why not expose ETag:
@@ -230,7 +236,7 @@ Tombstone example:
 Fields:
 - `v`: envelope schema version (1).
 - `state`: `"live"` or `"tombstone"`.
-- `key`: the application key as stored (post-validation) for self-check/debug.
+- `key`: the application key as stored (post-validation). On read, mismatch with requested key -> ErrCorrupt.
 - `rev`: logical revision (uint64, decimal in JSON).
 - For `live`: `value_b64` (standard base64) and `value_sha256` (hex lowercase). On GET, we verify the checksum; mismatch -> `ErrCorrupt`.
 - `created_at`: RFC3339Nano UTC. Derived from the writer's clock; best-effort only.
@@ -264,7 +270,7 @@ Create-after-GC race:
 ## 5) Failure modes and contention
 
 - Crash between read and conditional write (Update/CAS/Delete): safe. The subsequent writer's If-Match fails if state changed; retries proceed.
-- Hot-key 412 storm: Under high contention, many CAS attempts will hit 412. We use exponential backoff with full jitter: default Base=10ms, factor 2, cap 500ms, MaxAttempts=8 (configurable). Expected serialization throughput per key is ~1 successful mutation per network RTT; with s3 p95 ~50–150ms, expect 6–15 writes/sec on a single hot key. Backoff dampens request rates from N contenders roughly to O(1) successes per RTT; losers back off.
+- Hot-key 412 storm: Under high contention, many CAS attempts will hit 412. We use exponential backoff with full jitter: default Base=10ms, multiplier x2 per retry, cap 500ms, MaxAttempts=8 (configurable). Expected serialization throughput per key is ~1 successful mutation per network RTT; with s3 p95 ~50–150ms, expect 6–15 writes/sec on a single hot key. Backoff dampens request rates from N contenders roughly to O(1) successes per RTT; losers back off.
 - Transient 5xx / SlowDown: Retry with the same backoff policy but without re-running UpdateFn unless a new GET is performed. All retries are bounded by context deadlines. Retries add jitter to avoid synchronization.
 - Clock skew: All correctness-critical decisions use S3 atomics; timestamps are for observability/GC windows only. We add `ClockSkewHint` to GC retention buffers to tolerate skew.
 - Partial-envelope corruption: `value_sha256` is verified on GET. Mismatch -> `ErrCorrupt`. Corruption of metadata fields is surfaced as JSON parse errors wrapped with context; the object is unreadable and must be operator-remediated. Higher layers should treat `ErrCorrupt` as permanent.
@@ -285,7 +291,6 @@ Construction via functional options (`Option`). Per-call write overrides via `Wr
 Per-call:
 - `WithRetryPolicy(RetryPolicy)` – override retry.
 - `WithIncludeTombstone()` – for Update: call `fn` with tombstone record (but still disallows resurrection; any attempt to write live value returns ErrDeleted).
-- `WithIfUnchangedETag(string)` – expert-level additional If-Match on CAS PUT for tighter fencing.
 
 Helper:
 ```go
@@ -307,7 +312,7 @@ Per key (best case, uncontended):
 
 Contention behavior:
 - Let RTT be end-to-end S3 round-trip (including JSON ser/de). Maximum sustainable per-key mutation throughput is roughly 1/RTT. With RTT=100ms, ~10/s. With N contenders >> 1, losers receive 412 and back off; aggregate client load is bounded by backoff.
-- Listing scalability: LIST is lexicographic and strongly consistent; GC workers page with MaxKeys=1k..5k per call. With large keyspaces (10^6 keys), single pass LIST costs ~200–1000 requests depending on page size.
+- Listing scalability: LIST is lexicographic and strongly consistent; GC workers page with MaxKeys chosen by backend (e.g., 1k..5k) per call. With large keyspaces (10^6 keys), single pass LIST costs ~200–1000 requests depending on page size.
 
 ## 8) State machines
 
