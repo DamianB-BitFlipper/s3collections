@@ -2,13 +2,13 @@ package queue
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"math/rand"
 	"strconv"
 	"strings"
 	"time"
@@ -122,8 +122,11 @@ type deadEnvelope struct {
 
 // jobEnvelope is the canonical JSON representation of a job stored by cas.
 type jobEnvelope struct {
-	ID          string           `json:"id"`
-	Queue       string           `json:"queue"`
+	ID    string `json:"id"`
+	Queue string `json:"queue"`
+	// Shard is the queue shard index. It is stored in JSON as a numeric
+	// value; S3 key layouts format the same value as four lower-case hex
+	// digits (for example, "00af").
 	Shard       uint16           `json:"shard"`
 	State       jobState         `json:"state"`
 	Attempts    int              `json:"attempts"`
@@ -177,20 +180,30 @@ func newJobEnvelope(id, queue string, shard uint16, payload []byte, createdAt, n
 	}
 }
 
-// generateJobID returns a deterministic or random job id.
-func generateJobID(queueName, idempotencyKey string, rnd *rand.Rand) string {
-	if idempotencyKey != "" {
-		h := sha256.Sum256([]byte(queueName + "|" + idempotencyKey))
-		return "idem-" + hex.EncodeToString(h[:])
-	}
-	usec := time.Now().UTC().UnixMicro()
+// idempotencyKeyHash returns the deterministic hash used for idempotent job ids.
+func idempotencyKeyHash(queueName, key string) string {
+	h := sha256.Sum256([]byte(queueName + "|" + key))
+	return hex.EncodeToString(h[:])
+}
+
+// randomSuffix returns 16 hex digits from crypto/rand.
+func randomSuffix() string {
 	b := make([]byte, 8)
-	if rnd != nil {
-		_, _ = rnd.Read(b)
-	} else {
-		_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand reads from the operating-system entropy source and
+		// essentially never returns an error in practice.
+		panic(fmt.Sprintf("queue: crypto/rand failed: %v", err))
 	}
-	return fmt.Sprintf("%020d-%s", usec, hex.EncodeToString(b))
+	return hex.EncodeToString(b)
+}
+
+// generateJobID returns a deterministic or random job id using the queue's
+// injected clock. Without an IdempotencyKey the result is "<usec20>-<rand16hex>".
+func generateJobID(queueName, idempotencyKey string, now time.Time) string {
+	if idempotencyKey != "" {
+		return "idem-" + idempotencyKeyHash(queueName, idempotencyKey)
+	}
+	return fmt.Sprintf("%020d-%s", now.UnixMicro(), randomSuffix())
 }
 
 // shardForJob computes the shard for jobID using FNV-1a 32-bit.

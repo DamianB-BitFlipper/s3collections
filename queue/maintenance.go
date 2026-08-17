@@ -65,6 +65,16 @@ func (q *Queue) maintenanceLoop(ctx context.Context) {
 	}
 }
 
+// listCAS wraps cas.Store.List with queue-level list-page metrics.
+func (q *Queue) listCAS(ctx context.Context, op, prefixTemplate string, opts *cas.ListOptions) (*cas.ListPage, error) {
+	page, err := q.store.List(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	q.recordListPage(ctx, op, prefixTemplate)
+	return page, nil
+}
+
 // reaperPass reclaims expired leases and backfills missing markers.
 func (q *Queue) reaperPass(ctx context.Context) {
 	start := time.Now()
@@ -105,12 +115,13 @@ func (q *Queue) reapShard(ctx context.Context, shard uint16) markerCounts {
 
 	// Expired leases.
 	leasePrefix := q.prefix + "shard/" + shardHex(shard) + "/lease/"
-	startAfter := ""
+	contToken := ""
 	for {
-		page, err := q.be.List(ctx, leasePrefix, &s3backend.ListOptions{
-			StartAfter: startAfter,
-			MaxKeys:    1000,
-		})
+		opts := &s3backend.ListOptions{MaxKeys: 1000}
+		if contToken != "" {
+			opts.ContinuationToken = contToken
+		}
+		page, err := q.listWithRetry(ctx, "reaper", leasePrefixTemplate, leasePrefix, opts)
 		if err != nil {
 			q.opts.Logger.Warn(err, "queue: reaper lease list failed", "shard", shard)
 			break
@@ -125,19 +136,22 @@ func (q *Queue) reapShard(ctx context.Context, shard uint16) markerCounts {
 				page.IsTruncated = false
 				break
 			}
-			q.reapExpiredLease(ctx, shard, jobID, now, &c)
+			q.reapExpiredLease(ctx, shard, jobID, expiryTS, now, &c)
 		}
 		if !page.IsTruncated {
 			break
 		}
-		startAfter = page.NextContinuationToken
-		if startAfter == "" {
+		contToken = page.NextContinuationToken
+		if contToken == "" {
 			break
 		}
 	}
 
 	// Backfill missing ready markers for pending jobs.
 	q.backfillReadyMarkers(ctx, shard)
+
+	// Backfill missing dead markers for dead jobs.
+	q.backfillDeadMarkers(ctx, shard)
 
 	// Best-effort depth counts.
 	c.ready = q.countMarkers(ctx, shard, "ready")
@@ -147,7 +161,7 @@ func (q *Queue) reapShard(ctx context.Context, shard uint16) markerCounts {
 }
 
 // reapExpiredLease reclaims one expired lease, recreating the ready marker.
-func (q *Queue) reapExpiredLease(ctx context.Context, shard uint16, jobID string, now time.Time, c *markerCounts) {
+func (q *Queue) reapExpiredLease(ctx context.Context, shard uint16, jobID string, expiryTS time.Time, now time.Time, c *markerCounts) {
 	appKey := jobAppKey(shard, jobID)
 	rec, err := q.store.Get(ctx, appKey)
 	if err != nil {
@@ -164,10 +178,16 @@ func (q *Queue) reapExpiredLease(ctx context.Context, shard uint16, jobID string
 		return
 	}
 	deadline := now.Add(q.opts.ClockSkewTolerance)
-	if env.Lease.Expiry.After(deadline) {
-		// Lease has been renewed; stale marker.
-		q.deleteMarker(ctx, q.leaseMarkerKey(shard, env.Lease.Expiry, jobID))
+	// A marker whose timestamp does not match the canonical lease is stale
+	// (e.g. the original marker left behind after a renew). Delete it without
+	// reclaiming. If the canonical lease itself is still in the future, leave
+	// the matching marker alone.
+	if !expiryTS.Equal(env.Lease.Expiry) {
+		q.deleteMarker(ctx, q.leaseMarkerKey(shard, expiryTS, jobID))
 		c.deletedLease++
+		return
+	}
+	if env.Lease.Expiry.After(deadline) {
 		return
 	}
 
@@ -199,7 +219,7 @@ func (q *Queue) reapExpiredLease(ctx context.Context, shard uint16, jobID string
 		q.opts.Logger.Warn(err, "queue: reaper CAS failed", "job", jobID)
 		return
 	}
-	if err := q.putMarker(ctx, q.readyMarkerKey(shard, newNotBefore, jobID), nil); err != nil {
+	if err := q.createMarker(ctx, q.readyMarkerKey(shard, newNotBefore, jobID)); err != nil {
 		q.opts.Logger.Warn(err, "queue: reaper ready marker failed", "job", jobID)
 	}
 	q.deleteMarker(ctx, q.leaseMarkerKey(shard, env.Lease.Expiry, jobID))
@@ -210,34 +230,104 @@ func (q *Queue) reapExpiredLease(ctx context.Context, shard uint16, jobID string
 // ready marker.
 func (q *Queue) backfillReadyMarkers(ctx context.Context, shard uint16) {
 	prefix := "shard/" + shardHex(shard) + "/jobs/"
-	page, err := q.store.List(ctx, &cas.ListOptions{Prefix: prefix, MaxKeys: 500})
-	if err != nil {
-		q.opts.Logger.Warn(err, "queue: reaper backfill list failed", "shard", shard)
-		return
+	startAfter := ""
+	for {
+		page, err := q.listCAS(ctx, "backfill", jobsPrefixTemplate, &cas.ListOptions{
+			Prefix:     prefix,
+			StartAfter: startAfter,
+			MaxKeys:    500,
+		})
+		if err != nil {
+			q.opts.Logger.Warn(err, "queue: reaper backfill list failed", "shard", shard)
+			return
+		}
+		for _, rec := range page.Records {
+			if rec.State != cas.Live {
+				continue
+			}
+			env, err := decodeJob(rec.Value)
+			if err != nil || env.State != statePending {
+				continue
+			}
+			jobID := env.ID
+			if err := q.createMarker(ctx, q.readyMarkerKey(shard, env.NotBefore, jobID)); err != nil {
+				q.opts.Logger.Warn(err, "queue: backfill ready marker failed", "job", jobID)
+			}
+		}
+		if !page.IsTruncated {
+			break
+		}
+		if len(page.Records) == 0 {
+			break
+		}
+		startAfter = page.Records[len(page.Records)-1].Key
 	}
-	for _, rec := range page.Records {
-		if rec.State != cas.Live {
-			continue
+}
+
+// backfillDeadMarkers lists canonical jobs and ensures dead jobs have a dead
+// marker.
+func (q *Queue) backfillDeadMarkers(ctx context.Context, shard uint16) {
+	prefix := "shard/" + shardHex(shard) + "/jobs/"
+	startAfter := ""
+	for {
+		page, err := q.listCAS(ctx, "backfill", jobsPrefixTemplate, &cas.ListOptions{
+			Prefix:     prefix,
+			StartAfter: startAfter,
+			MaxKeys:    500,
+		})
+		if err != nil {
+			q.opts.Logger.Warn(err, "queue: reaper dead backfill list failed", "shard", shard)
+			return
 		}
-		env, err := decodeJob(rec.Value)
-		if err != nil || env.State != statePending {
-			continue
+		for _, rec := range page.Records {
+			if rec.State != cas.Live {
+				continue
+			}
+			env, err := decodeJob(rec.Value)
+			if err != nil || env.State != stateDead || env.Dead == nil {
+				continue
+			}
+			jobID := env.ID
+			if err := q.createMarker(ctx, q.deadMarkerKey(shard, env.Dead.At, jobID)); err != nil {
+				// A precondition failure means the marker already exists.
+				if !errors.Is(err, s3backend.ErrPreconditionFailed) {
+					q.opts.Logger.Warn(err, "queue: backfill dead marker failed", "job", jobID)
+				}
+			}
 		}
-		jobID := env.ID
-		if err := q.putMarker(ctx, q.readyMarkerKey(shard, env.NotBefore, jobID), nil); err != nil {
-			q.opts.Logger.Warn(err, "queue: backfill ready marker failed", "job", jobID)
+		if !page.IsTruncated {
+			break
 		}
+		if len(page.Records) == 0 {
+			break
+		}
+		startAfter = page.Records[len(page.Records)-1].Key
 	}
 }
 
 // countMarkers returns the number of raw marker objects of kind.
 func (q *Queue) countMarkers(ctx context.Context, shard uint16, kind string) int {
 	prefix := q.prefix + "shard/" + shardHex(shard) + "/" + kind + "/"
-	page, err := q.be.List(ctx, prefix, &s3backend.ListOptions{MaxKeys: 1000})
+	prefixTemplate := markerKindPrefixTemplate(kind)
+	page, err := q.listWithRetry(ctx, "reaper", prefixTemplate, prefix, &s3backend.ListOptions{MaxKeys: 1000})
 	if err != nil {
 		return 0
 	}
 	return len(page.Objects)
+}
+
+// markerKindPrefixTemplate returns the static metric prefix template for a
+// raw marker kind.
+func markerKindPrefixTemplate(kind string) string {
+	switch kind {
+	case "ready":
+		return readyPrefixTemplate
+	case "lease":
+		return leasePrefixTemplate
+	case "dead":
+		return deadPrefixTemplate
+	}
+	return "queue/<name>/shard/<hhhh>/" + kind + "/"
 }
 
 // gcPass removes completed/dead jobs past retention and cleans orphan markers.
@@ -271,7 +361,7 @@ func (q *Queue) gcShard(ctx context.Context, shard uint16) markerCounts {
 	prefix := "shard/" + shardHex(shard) + "/jobs/"
 	startAfter := ""
 	for {
-		page, err := q.store.List(ctx, &cas.ListOptions{
+		page, err := q.listCAS(ctx, "gc", jobsPrefixTemplate, &cas.ListOptions{
 			Prefix:     prefix,
 			StartAfter: startAfter,
 			MaxKeys:    500,
@@ -315,10 +405,10 @@ func (q *Queue) gcShard(ctx context.Context, shard uint16) markerCounts {
 		if !page.IsTruncated {
 			break
 		}
-		startAfter = page.NextContinuationToken
-		if startAfter == "" {
+		if len(page.Records) == 0 {
 			break
 		}
+		startAfter = page.Records[len(page.Records)-1].Key
 	}
 
 	// Orphan marker cleanup.
@@ -346,44 +436,59 @@ func (q *Queue) cleanMarkers(ctx context.Context, shard uint16, jobID string, en
 // inconsistent state.
 func (q *Queue) cleanOrphanMarkers(ctx context.Context, shard uint16, kind string, c *markerCounts) {
 	prefix := q.prefix + "shard/" + shardHex(shard) + "/" + kind + "/"
-	page, err := q.be.List(ctx, prefix, &s3backend.ListOptions{MaxKeys: 1000})
-	if err != nil {
-		return
-	}
-	for _, info := range page.Objects {
-		_, mk, _, jobID, ok := q.parseMarker(info.Key)
-		if !ok {
-			continue
+	prefixTemplate := markerKindPrefixTemplate(kind)
+	contToken := ""
+	for {
+		opts := &s3backend.ListOptions{MaxKeys: 1000}
+		if contToken != "" {
+			opts.ContinuationToken = contToken
 		}
-		appKey := jobAppKey(shard, jobID)
-		rec, err := q.store.Get(ctx, appKey)
+		page, err := q.listWithRetry(ctx, "reaper", prefixTemplate, prefix, opts)
 		if err != nil {
-			if errors.Is(err, cas.ErrNotFound) {
-				q.deleteMarker(ctx, info.Key)
-			}
-			continue
+			return
 		}
-		env, err := decodeJob(rec.Value)
-		if err != nil {
-			q.deleteMarker(ctx, info.Key)
-			continue
+		for _, info := range page.Objects {
+			_, mk, _, jobID, ok := q.parseMarker(info.Key)
+			if !ok {
+				continue
+			}
+			appKey := jobAppKey(shard, jobID)
+			rec, err := q.store.Get(ctx, appKey)
+			if err != nil {
+				if errors.Is(err, cas.ErrNotFound) {
+					q.deleteMarker(ctx, info.Key)
+				}
+				continue
+			}
+			env, err := decodeJob(rec.Value)
+			if err != nil {
+				q.deleteMarker(ctx, info.Key)
+				continue
+			}
+			switch mk {
+			case "ready":
+				if env.State != statePending {
+					q.deleteMarker(ctx, info.Key)
+					c.deletedReady++
+				}
+			case "lease":
+				if env.State != stateClaimed || env.Lease == nil {
+					q.deleteMarker(ctx, info.Key)
+					c.deletedLease++
+				}
+			case "dead":
+				if env.State != stateDead {
+					q.deleteMarker(ctx, info.Key)
+					c.deletedDead++
+				}
+			}
 		}
-		switch mk {
-		case "ready":
-			if env.State != statePending {
-				q.deleteMarker(ctx, info.Key)
-				c.deletedReady++
-			}
-		case "lease":
-			if env.State != stateClaimed || env.Lease == nil {
-				q.deleteMarker(ctx, info.Key)
-				c.deletedLease++
-			}
-		case "dead":
-			if env.State != stateDead {
-				q.deleteMarker(ctx, info.Key)
-				c.deletedDead++
-			}
+		if !page.IsTruncated {
+			break
+		}
+		contToken = page.NextContinuationToken
+		if contToken == "" {
+			break
 		}
 	}
 }

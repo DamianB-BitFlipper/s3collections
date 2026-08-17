@@ -75,64 +75,107 @@ func (q *Queue) listDeadSingleShard(ctx context.Context, shard uint16, startAfte
 	if startAfterSuffix != "" {
 		startAfter = prefix + startAfterSuffix
 	}
-	page, err := q.be.List(ctx, prefix, &s3backend.ListOptions{
+	items := make([]DeadItem, 0, limit)
+	var next string
+	opts := &s3backend.ListOptions{
 		StartAfter: startAfter,
 		MaxKeys:    limit,
-	})
-	if err != nil {
-		return nil, "", err
 	}
-	items, err := q.deadMarkersToItems(ctx, page.Objects, shard, now)
-	if err != nil {
-		return nil, "", err
+	if opts.MaxKeys < 1 {
+		opts.MaxKeys = 1
 	}
-	var next string
-	if page.IsTruncated && len(page.Objects) > 0 {
-		last := page.Objects[len(page.Objects)-1].Key
-		if _, _, _, _, ok := q.parseMarker(last); ok {
-			// Suffix after "dead/".
-			rest := strings.TrimPrefix(last, prefix)
-			next = rest
+	for len(items) < limit {
+		page, err := q.listWithRetry(ctx, "list_dead", deadPrefixTemplate, prefix, opts)
+		if err != nil {
+			return nil, "", err
 		}
+		chunk, err := q.deadMarkersToItems(ctx, page.Objects, shard, now)
+		if err != nil {
+			return nil, "", err
+		}
+		items = append(items, chunk...)
+		if !page.IsTruncated {
+			break
+		}
+		if len(items) >= limit {
+			// Enough items; cursor resumes after the last object in this page.
+			if len(page.Objects) > 0 {
+				last := page.Objects[len(page.Objects)-1].Key
+				next = strings.TrimPrefix(last, prefix)
+			}
+			break
+		}
+		// Continue with the opaque continuation token issued by the backend.
+		opts.StartAfter = ""
+		opts.ContinuationToken = page.NextContinuationToken
+		opts.MaxKeys = limit - len(items)
+		if opts.MaxKeys < 1 {
+			opts.MaxKeys = 1
+		}
+	}
+	if len(items) > limit {
+		items = items[:limit]
 	}
 	return items, next, nil
 }
 
 func (q *Queue) listDeadAllShards(ctx context.Context, startAfterCursor string, limit int, now time.Time) ([]DeadItem, string, error) {
 	startShard := uint16(0)
-	startAfter := ""
+	startSuffix := ""
 	if startAfterCursor != "" {
-		parts := strings.SplitN(startAfterCursor, "/", 3)
-		if len(parts) == 3 {
+		parts := strings.SplitN(startAfterCursor, "/", 2)
+		if len(parts) >= 1 {
 			n, err := strconv.ParseUint(parts[0], 16, 16)
 			if err == nil {
 				startShard = uint16(n)
-				startAfter = "dead/" + parts[1] + "/" + parts[2]
+				if len(parts) == 2 {
+					startSuffix = parts[1]
+				}
 			}
 		}
 	}
 
+	pageSize := limit
+	if pageSize <= 0 || pageSize > 1000 {
+		pageSize = 1000
+	}
+	if pageSize < 1 {
+		pageSize = 1
+	}
+
 	items := make([]DeadItem, 0, limit)
-	lastCursor := ""
 	for s := startShard; s < q.opts.Shards; s++ {
 		prefix := q.prefix + "shard/" + shardHex(s) + "/dead/"
-		sa := ""
-		if startAfter != "" {
-			sa = prefix + startAfter
+		startAfter := ""
+		if s == startShard && startSuffix != "" {
+			startAfter = prefix + startSuffix
+		}
+		contToken := ""
+		for {
+			opts := &s3backend.ListOptions{MaxKeys: pageSize}
+			if contToken != "" {
+				opts.ContinuationToken = contToken
+			} else if startAfter != "" {
+				opts.StartAfter = startAfter
+			}
+			page, err := q.listWithRetry(ctx, "list_dead", deadPrefixTemplate, prefix, opts)
+			if err != nil {
+				return nil, "", err
+			}
+			chunk, err := q.deadMarkersToItems(ctx, page.Objects, s, now)
+			if err != nil {
+				return nil, "", err
+			}
+			items = append(items, chunk...)
+			if !page.IsTruncated {
+				break
+			}
+			contToken = page.NextContinuationToken
 			startAfter = ""
+			if contToken == "" {
+				break
+			}
 		}
-		page, err := q.be.List(ctx, prefix, &s3backend.ListOptions{
-			StartAfter: sa,
-			MaxKeys:    limit - len(items),
-		})
-		if err != nil {
-			return nil, "", err
-		}
-		chunk, err := q.deadMarkersToItems(ctx, page.Objects, s, now)
-		if err != nil {
-			return nil, "", err
-		}
-		items = append(items, chunk...)
 	}
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].When.Equal(items[j].When) {
@@ -140,14 +183,13 @@ func (q *Queue) listDeadAllShards(ctx context.Context, startAfterCursor string, 
 		}
 		return items[i].When.Before(items[j].When)
 	})
+	var next string
 	if len(items) > limit {
-		if limit > 0 {
-			last := items[limit-1]
-			lastCursor = shardHex(last.Shard) + "/" + ts20(last.When) + "/" + last.ID
-		}
+		last := items[limit-1]
+		next = shardHex(last.Shard) + "/dead/" + ts20(last.When) + "/" + last.ID
 		items = items[:limit]
 	}
-	return items, lastCursor, nil
+	return items, next, nil
 }
 
 func (q *Queue) deadMarkersToItems(ctx context.Context, objects []s3backend.ObjectInfo, shard uint16, now time.Time) ([]DeadItem, error) {
@@ -239,7 +281,7 @@ func (q *Queue) RequeueDead(ctx context.Context, jobID string, shard uint16) err
 			return err
 		}
 		_ = rec2
-		if err := q.putMarker(ctx, q.readyMarkerKey(shard, now, jobID), nil); err != nil {
+		if err := q.createMarker(ctx, q.readyMarkerKey(shard, now, jobID)); err != nil {
 			q.opts.Logger.Warn(err, "queue: requeue dead ready marker failed", "job", jobID)
 		}
 		q.deleteDeadMarkerForJob(ctx, shard, jobID)
@@ -259,14 +301,27 @@ func (q *Queue) RequeueDead(ctx context.Context, jobID string, shard uint16) err
 // deleteDeadMarkerForJob best-effort deletes any dead marker for jobID in shard.
 func (q *Queue) deleteDeadMarkerForJob(ctx context.Context, shard uint16, jobID string) {
 	prefix := q.prefix + "shard/" + shardHex(shard) + "/dead/"
-	page, err := q.be.List(ctx, prefix, &s3backend.ListOptions{MaxKeys: 100})
-	if err != nil {
-		return
-	}
-	for _, info := range page.Objects {
-		_, _, _, id, ok := q.parseMarker(info.Key)
-		if ok && id == jobID {
-			q.deleteMarker(ctx, info.Key)
+	token := ""
+	for {
+		page, err := q.listWithRetry(ctx, "list_dead", deadPrefixTemplate, prefix, &s3backend.ListOptions{
+			ContinuationToken: token,
+			MaxKeys:           1000,
+		})
+		if err != nil {
+			return
+		}
+		for _, info := range page.Objects {
+			_, _, _, id, ok := q.parseMarker(info.Key)
+			if ok && id == jobID {
+				q.deleteMarker(ctx, info.Key)
+			}
+		}
+		if !page.IsTruncated {
+			return
+		}
+		token = page.NextContinuationToken
+		if token == "" {
+			return
 		}
 	}
 }

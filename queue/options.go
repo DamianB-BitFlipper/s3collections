@@ -167,6 +167,109 @@ func applyDefaults(o *Options) {
 	}
 }
 
+// WithShards sets the number of queue shards.
+func WithShards(n uint16) Option {
+	return func(o *Options) { o.Shards = n }
+}
+
+// WithWorkerID sets the worker identity stored in job leases.
+func WithWorkerID(id string) Option {
+	return func(o *Options) { o.WorkerID = id }
+}
+
+// WithDefaultVisibilityTimeout sets the visibility timeout used when Claim is
+// called with a zero VisibilityTimeout.
+func WithDefaultVisibilityTimeout(d time.Duration) Option {
+	return func(o *Options) { o.DefaultVisibilityTimeout = d }
+}
+
+// WithClockSkewTolerance sets the clock-skew margin for lease timing.
+func WithClockSkewTolerance(d time.Duration) Option {
+	return func(o *Options) { o.ClockSkewTolerance = d }
+}
+
+// WithClaimPageSize sets the maximum number of ready markers per LIST page
+// during Claim.
+func WithClaimPageSize(n int) Option {
+	return func(o *Options) { o.ClaimPageSize = n }
+}
+
+// WithClaimMaxPages sets the maximum number of LIST pages per shard during Claim.
+func WithClaimMaxPages(n int) Option {
+	return func(o *Options) { o.ClaimMaxPages = n }
+}
+
+// WithClaimShardProbe sets the number of shards examined by a single Claim call
+// when RestrictToShards is empty.
+func WithClaimShardProbe(n int) Option {
+	return func(o *Options) { o.ClaimShardProbe = n }
+}
+
+// WithReaperInterval sets the base period between reaper passes.
+func WithReaperInterval(d time.Duration) Option {
+	return func(o *Options) { o.ReaperInterval = d }
+}
+
+// WithGCInterval sets the base period between garbage-collection passes.
+func WithGCInterval(d time.Duration) Option {
+	return func(o *Options) { o.GCInterval = d }
+}
+
+// WithCompletedRetention sets how long completed jobs are kept before being
+// tombstoned.
+func WithCompletedRetention(d time.Duration) Option {
+	return func(o *Options) { o.CompletedRetention = d }
+}
+
+// WithDeadRetention sets how long dead-lettered jobs are kept before being
+// tombstoned.
+func WithDeadRetention(d time.Duration) Option {
+	return func(o *Options) { o.DeadRetention = d }
+}
+
+// WithMaxAttempts sets the maximum delivery attempts before Retry dead-letters
+// a job. Zero means unlimited.
+func WithMaxAttempts(n int) Option {
+	return func(o *Options) { o.MaxAttempts = n }
+}
+
+// WithReasonHistory caps the number of recent retry/dead reasons stored in the
+// job envelope.
+func WithReasonHistory(n int) Option {
+	return func(o *Options) { o.ReasonHistory = n }
+}
+
+// WithSequencerEnabled enables strict global ordering via a single CAS key.
+func WithSequencerEnabled(v bool) Option {
+	return func(o *Options) { o.SequencerEnabled = v }
+}
+
+// WithRetry sets the retry policy used for backend marker operations and
+// forwarded to the internal cas.Store.
+func WithRetry(p s3collections.RetryPolicy) Option {
+	return func(o *Options) { o.Retry = p }
+}
+
+// WithMeter sets the metric sink.
+func WithMeter(m s3collections.Meter) Option {
+	return func(o *Options) { o.Meter = m }
+}
+
+// WithLogger sets the logger.
+func WithLogger(l s3collections.Logger) Option {
+	return func(o *Options) { o.Logger = l }
+}
+
+// WithTracer sets the tracer.
+func WithTracer(t s3collections.Tracer) Option {
+	return func(o *Options) { o.Tracer = t }
+}
+
+// WithMaxPayloadBytes caps the payload size accepted by Enqueue.
+func WithMaxPayloadBytes(n int) Option {
+	return func(o *Options) { o.MaxPayloadBytes = n }
+}
+
 func randomWorkerID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)

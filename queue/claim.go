@@ -29,6 +29,10 @@ type EnqueueOptions struct {
 // Enqueue stores payload as a new pending job. With IdempotencyKey it returns
 // existed=true if the canonical job object already exists, without creating a
 // duplicate. The returned job id is deterministic for idempotent enqueues.
+//
+// In sequencer mode the job id is "<seq20>-<rand16hex>" (or
+// "<seq20>-idem-<hash>" for idempotent jobs) so that ids remain lexicographically
+// ordered by sequence number.
 func (q *Queue) Enqueue(ctx context.Context, payload []byte, opts EnqueueOptions) (jobID string, existed bool, err error) {
 	start := time.Now()
 	if len(payload) > q.opts.MaxPayloadBytes {
@@ -36,16 +40,14 @@ func (q *Queue) Enqueue(ctx context.Context, payload []byte, opts EnqueueOptions
 		q.recordEvent(ctx, "enqueue", outcomeError)
 		return "", false, cas.ErrTooLarge
 	}
-	jobID = generateJobID(q.name, opts.IdempotencyKey, nil)
-	if q.opts.SequencerEnabled && opts.IdempotencyKey == "" {
-		seq, err := q.nextSequence(ctx)
-		if err != nil {
-			q.observeLatency(ctx, "enqueue", outcomeError, time.Since(start))
-			q.recordEvent(ctx, "enqueue", outcomeError)
-			return "", false, fmt.Errorf("queue: sequencer failed: %w", err)
-		}
-		jobID = fmt.Sprintf("%020d-%s", seq, jobID)
+
+	jobID, err = q.newJobID(ctx, opts.IdempotencyKey)
+	if err != nil {
+		q.observeLatency(ctx, "enqueue", outcomeError, time.Since(start))
+		q.recordEvent(ctx, "enqueue", outcomeError)
+		return "", false, fmt.Errorf("queue: job id generation failed: %w", err)
 	}
+
 	shard := q.resolveShard(jobID, opts.Shard)
 	appKey := jobAppKey(shard, jobID)
 	notBefore := q.now().Add(opts.Delay)
@@ -59,7 +61,7 @@ func (q *Queue) Enqueue(ctx context.Context, payload []byte, opts EnqueueOptions
 
 	_, err = q.store.Create(ctx, appKey, body)
 	if err == nil {
-		if err := q.putMarker(ctx, q.readyMarkerKey(shard, notBefore, jobID), nil); err != nil {
+		if err := q.createMarker(ctx, q.readyMarkerKey(shard, notBefore, jobID)); err != nil {
 			q.opts.Logger.Warn(err, "queue: ready marker create failed", "job", jobID)
 		}
 		q.observeLatency(ctx, "enqueue", outcomeSuccess, time.Since(start))
@@ -78,6 +80,24 @@ func (q *Queue) Enqueue(ctx context.Context, payload []byte, opts EnqueueOptions
 	return "", false, err
 }
 
+// newJobID returns a job id appropriate for the queue configuration.
+func (q *Queue) newJobID(ctx context.Context, idempotencyKey string) (string, error) {
+	if q.opts.SequencerEnabled {
+		seq, err := q.nextSequence(ctx)
+		if err != nil {
+			return "", err
+		}
+		if idempotencyKey != "" {
+			return fmt.Sprintf("%020d-idem-%s", seq, idempotencyKeyHash(q.name, idempotencyKey)), nil
+		}
+		return fmt.Sprintf("%020d-%s", seq, randomSuffix()), nil
+	}
+	if idempotencyKey != "" {
+		return "idem-" + idempotencyKeyHash(q.name, idempotencyKey), nil
+	}
+	return fmt.Sprintf("%020d-%s", q.now().UnixMicro(), randomSuffix()), nil
+}
+
 // resolveShard returns the shard for a job, honoring an explicit pin.
 // When the sequencer is enabled, strict ordering requires a single shard.
 func (q *Queue) resolveShard(jobID string, pin *uint16) uint16 {
@@ -90,9 +110,10 @@ func (q *Queue) resolveShard(jobID string, pin *uint16) uint16 {
 	return shardForJob(jobID, q.opts.Shards)
 }
 
-// putMarker writes a zero-byte raw marker object, retrying transient errors.
-func (q *Queue) putMarker(ctx context.Context, key string, pre *s3backend.Preconditions) error {
-	return q.putMarkerWithRetry(ctx, key, pre)
+// createMarker writes a zero-byte raw marker object with If-None-Match:*,
+// retrying transient errors.
+func (q *Queue) createMarker(ctx context.Context, key string) error {
+	return q.putMarkerWithRetry(ctx, key, &s3backend.Preconditions{IfNoneMatch: true})
 }
 
 // deleteMarker best-effort deletes a raw marker, retrying transient errors.
@@ -103,12 +124,13 @@ func (q *Queue) deleteMarker(ctx context.Context, key string) {
 }
 
 // listWithRetry calls be.List with the configured retry policy.
-func (q *Queue) listWithRetry(ctx context.Context, prefix string, opts *s3backend.ListOptions) (*s3backend.ListPage, error) {
+func (q *Queue) listWithRetry(ctx context.Context, op, prefixTemplate, prefix string, opts *s3backend.ListOptions) (*s3backend.ListPage, error) {
 	policy := q.opts.Retry
 	nextDelay := s3collections.BackoffDelays(policy, nil)
 	for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
 		page, err := q.be.List(ctx, prefix, opts)
 		if err == nil {
+			q.recordListPage(ctx, op, prefixTemplate)
 			return page, nil
 		}
 		if ctx.Err() != nil {
@@ -120,6 +142,7 @@ func (q *Queue) listWithRetry(ctx context.Context, prefix string, opts *s3backen
 		if attempt == policy.MaxAttempts {
 			return nil, err
 		}
+		q.recordRetry(ctx, "list")
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -147,6 +170,7 @@ func (q *Queue) putMarkerWithRetry(ctx context.Context, key string, pre *s3backe
 		if attempt == policy.MaxAttempts {
 			return err
 		}
+		q.recordRetry(ctx, "put_marker")
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -174,6 +198,7 @@ func (q *Queue) deleteMarkerWithRetry(ctx context.Context, key string) error {
 		if attempt == policy.MaxAttempts {
 			return err
 		}
+		q.recordRetry(ctx, "delete_marker")
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -247,16 +272,17 @@ func (q *Queue) claimShards(restrict []uint16) []uint16 {
 // claimShard attempts to claim a job from a single shard.
 func (q *Queue) claimShard(ctx context.Context, shard uint16, vt time.Duration) (*Job, error) {
 	prefix := q.prefix + "shard/" + shardHex(shard) + "/ready/"
-	startAfter := ""
 	now := q.now()
 	deadline := now.Add(q.opts.ClockSkewTolerance)
 	pages := 0
+	contToken := ""
 	for pages < q.opts.ClaimMaxPages {
 		pages++
-		page, err := q.listWithRetry(ctx, prefix, &s3backend.ListOptions{
-			StartAfter: startAfter,
-			MaxKeys:    q.opts.ClaimPageSize,
-		})
+		opts := &s3backend.ListOptions{MaxKeys: q.opts.ClaimPageSize}
+		if contToken != "" {
+			opts.ContinuationToken = contToken
+		}
+		page, err := q.listWithRetry(ctx, "claim", readyPrefixTemplate, prefix, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -279,8 +305,8 @@ func (q *Queue) claimShard(ctx context.Context, shard uint16, vt time.Duration) 
 		if !page.IsTruncated {
 			break
 		}
-		startAfter = page.NextContinuationToken
-		if startAfter == "" {
+		contToken = page.NextContinuationToken
+		if contToken == "" {
 			break
 		}
 	}
@@ -339,13 +365,14 @@ func (q *Queue) tryClaimJob(ctx context.Context, shard uint16, jobID string, vt 
 	})
 	if err != nil {
 		if errors.Is(err, cas.ErrConflict) {
+			q.recordConflict(ctx, "claim")
 			return nil, false, nil
 		}
 		return nil, false, err
 	}
 
 	// Update succeeded. Write lease marker, delete ready marker.
-	if err := q.putMarker(ctx, q.leaseMarkerKey(shard, expiry, jobID), nil); err != nil {
+	if err := q.createMarker(ctx, q.leaseMarkerKey(shard, expiry, jobID)); err != nil {
 		q.opts.Logger.Warn(err, "queue: lease marker create failed", "job", jobID)
 	}
 	q.deleteReadyMarker(ctx, shard, env.NotBefore, jobID)
@@ -368,7 +395,7 @@ func (q *Queue) tryClaimJob(ctx context.Context, shard uint16, jobID string, vt 
 
 // ensureLeaseMarker creates a lease marker if it appears missing.
 func (q *Queue) ensureLeaseMarker(ctx context.Context, shard uint16, jobID string, expiry time.Time) {
-	if err := q.putMarker(ctx, q.leaseMarkerKey(shard, expiry, jobID), nil); err != nil {
+	if err := q.createMarker(ctx, q.leaseMarkerKey(shard, expiry, jobID)); err != nil {
 		q.opts.Logger.Warn(err, "queue: lease marker backfill failed", "job", jobID)
 	}
 }
@@ -381,25 +408,34 @@ func (q *Queue) deleteReadyMarker(ctx context.Context, shard uint16, notBefore t
 // renewJob extends the lease of a claimed job.
 func (q *Queue) renewJob(ctx context.Context, j *Job, extendBy time.Duration) error {
 	start := time.Now()
-	_, err := q.updateJob(ctx, j.appKey, func(env *jobEnvelope) (*jobEnvelope, error) {
+	oldExpiry := j.Lease.Expiry
+	rec, err := q.updateJob(ctx, j.appKey, func(env *jobEnvelope) (*jobEnvelope, error) {
 		if env.State != stateClaimed || env.Lease == nil || env.Lease.Owner != j.Lease.Owner {
 			return nil, ErrNotLeased
 		}
 		next := *env
 		newExpiry := maxTime(env.Lease.Expiry, q.now()).Add(extendBy)
 		next.Lease = &leaseEnvelope{Owner: j.Lease.Owner, Expiry: newExpiry}
-		j.Lease.Expiry = newExpiry
 		return &next, nil
 	})
 	if err != nil {
 		outcome := outcomeError
 		if errors.Is(err, ErrStaleLease) {
+			q.recordConflict(ctx, "renew")
 			outcome = outcomeConflict
 		}
 		q.observeLatency(ctx, "renew", outcome, time.Since(start))
 		q.recordEvent(ctx, "renew", outcome)
 		return err
 	}
+	j.Fence = rec.Revision
+	if env, _ := decodeJob(rec.Value); env != nil && env.Lease != nil {
+		j.Lease.Expiry = env.Lease.Expiry
+	}
+	if err := q.createMarker(ctx, q.leaseMarkerKey(j.Shard, j.Lease.Expiry, j.ID)); err != nil {
+		q.opts.Logger.Warn(err, "queue: renewed lease marker create failed", "job", j.ID)
+	}
+	q.deleteMarker(ctx, q.leaseMarkerKey(j.Shard, oldExpiry, j.ID))
 	q.observeLatency(ctx, "renew", outcomeSuccess, time.Since(start))
 	q.recordEvent(ctx, "renew", outcomeSuccess)
 	return nil
@@ -425,6 +461,7 @@ func (q *Queue) completeJob(ctx context.Context, j *Job) error {
 	if err != nil {
 		outcome := outcomeError
 		if errors.Is(err, ErrStaleLease) {
+			q.recordConflict(ctx, "complete")
 			outcome = outcomeConflict
 		}
 		q.observeLatency(ctx, "complete", outcome, time.Since(start))
@@ -472,6 +509,7 @@ func (q *Queue) retryJob(ctx context.Context, j *Job, opts RetryOptions) error {
 	if err != nil {
 		outcome := outcomeError
 		if errors.Is(err, ErrStaleLease) {
+			q.recordConflict(ctx, "retry")
 			outcome = outcomeConflict
 		}
 		q.observeLatency(ctx, "retry", outcome, time.Since(start))
@@ -482,10 +520,12 @@ func (q *Queue) retryJob(ctx context.Context, j *Job, opts RetryOptions) error {
 	// Decode resulting state to create the right marker.
 	env, _ := decodeJob(rec.Value)
 	if env != nil && env.State == stateDead {
-		if err := q.putMarker(ctx, q.deadMarkerKey(j.Shard, now, j.ID), nil); err != nil {
+		if err := q.createMarker(ctx, q.deadMarkerKey(j.Shard, now, j.ID)); err != nil {
 			q.opts.Logger.Warn(err, "queue: dead marker create failed", "job", j.ID)
 		}
 		q.deleteMarker(ctx, q.leaseMarkerKey(j.Shard, j.Lease.Expiry, j.ID))
+		j.Fence = rec.Revision
+		j.Lease = Lease{}
 		q.observeLatency(ctx, "retry", outcomeDead, time.Since(start))
 		q.recordEvent(ctx, "retry", outcomeDead)
 		return nil
@@ -495,7 +535,7 @@ func (q *Queue) retryJob(ctx context.Context, j *Job, opts RetryOptions) error {
 	if env != nil {
 		notBefore = env.NotBefore
 	}
-	if err := q.putMarker(ctx, q.readyMarkerKey(j.Shard, notBefore, j.ID), nil); err != nil {
+	if err := q.createMarker(ctx, q.readyMarkerKey(j.Shard, notBefore, j.ID)); err != nil {
 		q.opts.Logger.Warn(err, "queue: ready marker recreate failed", "job", j.ID)
 	}
 	q.deleteMarker(ctx, q.leaseMarkerKey(j.Shard, j.Lease.Expiry, j.ID))
@@ -534,6 +574,7 @@ func (q *Queue) deadJob(ctx context.Context, j *Job, reason string) error {
 	if err != nil {
 		outcome := outcomeError
 		if errors.Is(err, ErrStaleLease) {
+			q.recordConflict(ctx, "dead")
 			outcome = outcomeConflict
 		}
 		q.observeLatency(ctx, "dead", outcome, time.Since(start))
@@ -541,7 +582,7 @@ func (q *Queue) deadJob(ctx context.Context, j *Job, reason string) error {
 		return err
 	}
 	if !alreadyDead {
-		if err := q.putMarker(ctx, q.deadMarkerKey(j.Shard, now, j.ID), nil); err != nil {
+		if err := q.createMarker(ctx, q.deadMarkerKey(j.Shard, now, j.ID)); err != nil {
 			q.opts.Logger.Warn(err, "queue: dead marker create failed", "job", j.ID)
 		}
 		q.deleteMarker(ctx, q.leaseMarkerKey(j.Shard, j.Lease.Expiry, j.ID))

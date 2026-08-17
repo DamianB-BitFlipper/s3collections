@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/damianb/s3collections"
 	"github.com/damianb/s3collections/cas"
 	"github.com/damianb/s3collections/s3backend"
 )
@@ -687,5 +689,268 @@ func TestSequencerEnabled(t *testing.T) {
 		if ids[i] <= ids[i-1] {
 			t.Fatalf("ids not increasing: %q vs %q", ids[i-1], ids[i])
 		}
+	}
+}
+
+func TestRenewCreatesLeaseMarkerAndFenceAdvances(t *testing.T) {
+	t.Parallel()
+	q, _, clk := testQueue(t, "renew-marker")
+	ctx := context.Background()
+
+	_, _, err := q.Enqueue(ctx, []byte("x"), EnqueueOptions{})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	job, err := q.Claim(ctx, ClaimOptions{VisibilityTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	fenceAfterClaim := job.Fence
+	originalExpiry := job.Lease.Expiry
+
+	if err := job.Renew(ctx, 30*time.Second); err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	if job.Fence <= fenceAfterClaim {
+		t.Fatalf("fence did not advance across renew: %d vs %d", job.Fence, fenceAfterClaim)
+	}
+	if !job.Lease.Expiry.After(originalExpiry) {
+		t.Fatalf("lease not extended: %v vs %v", job.Lease.Expiry, originalExpiry)
+	}
+
+	// Original expiry passes; reaper must NOT reclaim the job.
+	clk.Advance(10 * time.Second)
+	q.reaperPass(ctx)
+	if _, err := q.Claim(ctx, ClaimOptions{}); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("expected ErrEmpty after original expiry, got %v", err)
+	}
+
+	// Renewed expiry passes; reaper MUST reclaim the job.
+	clk.Advance(35 * time.Second)
+	q.reaperPass(ctx)
+	job2, err := q.Claim(ctx, ClaimOptions{})
+	if err != nil {
+		t.Fatalf("Claim after renewed expiry: %v", err)
+	}
+	if job2.ID != job.ID {
+		t.Fatalf("reaper reclaimed wrong job: %s vs %s", job2.ID, job.ID)
+	}
+}
+
+func TestReaperBackfillsDeadMarker(t *testing.T) {
+	t.Parallel()
+	q, mem, clk := testQueue(t, "backfill-dead")
+	ctx := context.Background()
+
+	now := clk.Now()
+	jobID := "dead-job-1"
+	shard := uint16(0)
+	env := newJobEnvelope(jobID, q.name, shard, []byte("payload"), now, now)
+	env.State = stateDead
+	env.Dead = &deadEnvelope{Reason: "crash", At: now}
+	body, err := encodeJob(env)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if _, err := q.store.Create(ctx, jobAppKey(shard, jobID), body); err != nil {
+		t.Fatalf("Create canonical dead job: %v", err)
+	}
+
+	deadPrefix := q.prefix + "shard/" + shardHex(shard) + "/dead/"
+	page, err := mem.List(ctx, deadPrefix, nil)
+	if err != nil {
+		t.Fatalf("List dead markers: %v", err)
+	}
+	if len(page.Objects) != 0 {
+		t.Fatalf("unexpected dead marker before reaper: %d", len(page.Objects))
+	}
+
+	q.reaperPass(ctx)
+
+	page, err = mem.List(ctx, deadPrefix, nil)
+	if err != nil {
+		t.Fatalf("List dead markers after reaper: %v", err)
+	}
+	if len(page.Objects) != 1 {
+		t.Fatalf("dead markers after reaper = %d, want 1", len(page.Objects))
+	}
+}
+
+func TestListDeadDenseShardPagination(t *testing.T) {
+	t.Parallel()
+	q, _, clk := testQueue(t, "dead-dense", func(o *Options) {
+		o.Shards = 1
+	})
+	ctx := context.Background()
+
+	const total = 1500
+	const limit = 1000
+	shard := uint16(0)
+	base := clk.Now()
+	for i := 0; i < total; i++ {
+		jobID := fmt.Sprintf("dead-%04d", i)
+		when := base.Add(time.Duration(i) * time.Microsecond)
+		env := newJobEnvelope(jobID, q.name, shard, []byte("p"), base, base)
+		env.State = stateDead
+		env.Dead = &deadEnvelope{Reason: "boom", At: when}
+		body, err := encodeJob(env)
+		if err != nil {
+			t.Fatalf("encode %d: %v", i, err)
+		}
+		if _, err := q.store.Create(ctx, jobAppKey(shard, jobID), body); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+		if err := q.createMarker(ctx, q.deadMarkerKey(shard, when, jobID)); err != nil {
+			t.Fatalf("dead marker %d: %v", i, err)
+		}
+	}
+
+	items, cursor, err := q.ListDead(ctx, ListDeadOptions{Shards: []uint16{shard}, Limit: limit})
+	if err != nil {
+		t.Fatalf("ListDead first page: %v", err)
+	}
+	if len(items) != limit {
+		t.Fatalf("first page len = %d, want %d", len(items), limit)
+	}
+	if cursor == "" {
+		t.Fatal("expected non-empty cursor after first page")
+	}
+	for i := 1; i < len(items); i++ {
+		if items[i].When.Before(items[i-1].When) {
+			t.Fatalf("first page not sorted at %d", i)
+		}
+	}
+
+	items2, cursor2, err := q.ListDead(ctx, ListDeadOptions{
+		Shards:     []uint16{shard},
+		Limit:      limit,
+		StartAfter: cursor,
+	})
+	if err != nil {
+		t.Fatalf("ListDead second page: %v", err)
+	}
+	if len(items2) != total-limit {
+		t.Fatalf("second page len = %d, want %d", len(items2), total-limit)
+	}
+	if cursor2 != "" {
+		t.Fatalf("expected empty cursor after second page, got %q", cursor2)
+	}
+	if items2[0].When.Before(items[limit-1].When) {
+		t.Fatal("second page starts before first page ended")
+	}
+}
+
+// flakyPutBackend fails the first N Put calls for marker keys with a retryable
+// error, then delegates to the wrapped backend.
+type flakyPutBackend struct {
+	s3backend.Backend
+	failFirstN int32
+	count      atomic.Int32
+}
+
+func (f *flakyPutBackend) Put(ctx context.Context, key string, body []byte, pre *s3backend.Preconditions) (string, error) {
+	if strings.Contains(key, "/ready/") && f.count.Add(1) <= f.failFirstN {
+		return "", &s3backend.Error{
+			Op:         "Put",
+			Key:        key,
+			StatusCode: 503,
+			Code:       "SlowDown",
+			Message:    "simulated retryable error",
+			Retryable:  true,
+		}
+	}
+	return f.Backend.Put(ctx, key, body, pre)
+}
+
+func TestPutMarkerRetryMetric(t *testing.T) {
+	t.Parallel()
+	meter := s3collections.NewCaptureMeter()
+	base := s3backend.NewMemory()
+	flaky := &flakyPutBackend{Backend: base, failFirstN: 1}
+	q, err := New(flaky, "metrics-retry",
+		WithMeter(meter),
+		func(o *Options) {
+			o.Retry = s3collections.RetryPolicy{
+				MaxAttempts: 3,
+				Base:        time.Millisecond,
+				Max:         time.Millisecond,
+				Jitter:      0,
+			}
+		},
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+	if _, _, err := q.Enqueue(ctx, []byte("x"), EnqueueOptions{}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if got := meter.Counter("s3collections_retries_total",
+		s3collections.L("component", "queue"),
+		s3collections.L("op", "put_marker"),
+		s3collections.L("reason", "backend")); got != 1 {
+		t.Fatalf("put_marker retries = %v, want 1", got)
+	}
+}
+
+func TestClaimConflictMetric(t *testing.T) {
+	t.Parallel()
+	meter := s3collections.NewCaptureMeter()
+	q, _, _ := testQueue(t, "metrics-conflict", WithMeter(meter), func(o *Options) {
+		o.Shards = 1
+		o.ClaimShardProbe = 1
+	})
+	ctx := context.Background()
+
+	if _, _, err := q.Enqueue(ctx, []byte("x"), EnqueueOptions{}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// Release multiple workers at once so they race for the single job.
+	barrier := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-barrier
+			job, err := q.Claim(ctx, ClaimOptions{})
+			if err == nil {
+				_ = job.Complete(ctx)
+			}
+		}()
+	}
+	close(barrier)
+	wg.Wait()
+	if got := meter.CounterSum("s3collections_conflicts_total"); got < 1 {
+		t.Fatalf("conflicts_total = %v, want >= 1", got)
+	}
+}
+
+func TestListDeadEmitsListPagesMetric(t *testing.T) {
+	t.Parallel()
+	meter := s3collections.NewCaptureMeter()
+	q, _, _ := testQueue(t, "metrics-list", WithMeter(meter))
+	ctx := context.Background()
+
+	_, _, err := q.Enqueue(ctx, []byte("x"), EnqueueOptions{})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	job, err := q.Claim(ctx, ClaimOptions{})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := job.Dead(ctx, "boom"); err != nil {
+		t.Fatalf("Dead: %v", err)
+	}
+	if _, _, err := q.ListDead(ctx, ListDeadOptions{Shards: []uint16{job.Shard}}); err != nil {
+		t.Fatalf("ListDead: %v", err)
+	}
+	if got := meter.Counter("s3collections_list_pages_total",
+		s3collections.L("component", "queue"),
+		s3collections.L("op", "list_dead"),
+		s3collections.L("prefix", "queue/<name>/shard/<hhhh>/dead/")); got < 1 {
+		t.Fatalf("list_pages_total{list_dead} = %v", got)
 	}
 }

@@ -151,6 +151,41 @@ func (q *Queue) nextSequence(ctx context.Context) (uint64, error) {
 	return seq, err
 }
 
+// Static prefix templates used as label values for s3collections_list_pages_total.
+// They intentionally do not contain queue names, shard values, or job IDs.
+const (
+	readyPrefixTemplate = "queue/<name>/shard/<hhhh>/ready/"
+	leasePrefixTemplate = "queue/<name>/shard/<hhhh>/lease/"
+	deadPrefixTemplate  = "queue/<name>/shard/<hhhh>/dead/"
+	jobsPrefixTemplate  = "queue/<name>/shard/<hhhh>/jobs/"
+)
+
+// recordRetry increments the backend-retry counter.
+func (q *Queue) recordRetry(ctx context.Context, op string) {
+	q.opts.Meter.IncCounter(ctx, "s3collections_retries_total", 1,
+		s3collections.L("component", "queue"),
+		s3collections.L("op", op),
+		s3collections.L("reason", "backend"),
+	)
+}
+
+// recordConflict increments the CAS-conflict counter for an operation.
+func (q *Queue) recordConflict(ctx context.Context, op string) {
+	q.opts.Meter.IncCounter(ctx, "s3collections_conflicts_total", 1,
+		s3collections.L("component", "queue"),
+		s3collections.L("op", op),
+	)
+}
+
+// recordListPage increments the list-pages counter.
+func (q *Queue) recordListPage(ctx context.Context, op, prefixTemplate string) {
+	q.opts.Meter.IncCounter(ctx, "s3collections_list_pages_total", 1,
+		s3collections.L("component", "queue"),
+		s3collections.L("op", op),
+		s3collections.L("prefix", prefixTemplate),
+	)
+}
+
 // outcome labels.
 const (
 	outcomeSuccess  = "success"
