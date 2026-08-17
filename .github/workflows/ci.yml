@@ -1,0 +1,27 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./... -race -count=1
+      - name: fuzz smoke (30s each)
+        run: |
+          for f in $(grep -rl "^func Fuzz" --include="*_test.go" . | xargs -I{} dirname {} | sort -u); do
+            for fn in $(grep -h "^func Fuzz" $f/*_test.go | sed 's/func \(Fuzz[A-Za-z0-9_]*\).*/\1/'); do
+              (cd $f && go test -run=NONE -fuzz=$fn -fuzztime=20s .)
+            done
+          done
