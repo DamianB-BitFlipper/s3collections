@@ -2,8 +2,10 @@ package s3backend
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -117,8 +119,15 @@ func (m *Memory) List(ctx context.Context, prefix string, opts *ListOptions) (*L
 	if opts != nil {
 		startAfter = opts.StartAfter
 		if opts.ContinuationToken != "" {
-			// The memory backend uses the last returned key as its token.
-			startAfter = opts.ContinuationToken
+			// Continuation tokens are opaque and strictly validated, like
+			// real S3: only tokens previously issued by List are accepted.
+			// This deliberately catches callers that synthesize tokens from
+			// keys (valid only against lenient fakes, never against S3).
+			k, err := decodeContinuationToken(opts.ContinuationToken)
+			if err != nil {
+				return nil, err
+			}
+			startAfter = k
 		}
 		if opts.MaxKeys > 0 {
 			maxKeys = opts.MaxKeys
@@ -135,11 +144,31 @@ func (m *Memory) List(ctx context.Context, prefix string, opts *ListOptions) (*L
 	if len(keys) > maxKeys {
 		page.IsTruncated = true
 		keys = keys[:maxKeys]
-		page.NextContinuationToken = keys[len(keys)-1]
+		page.NextContinuationToken = encodeContinuationToken(keys[len(keys)-1])
 	}
 	for _, k := range keys {
 		o := m.objects[k]
 		page.Objects = append(page.Objects, ObjectInfo{Key: k, ETag: o.etag, Size: int64(len(o.body)), ModTime: o.modTime})
 	}
 	return page, nil
+}
+
+// continuationTokenPrefix marks opaque continuation tokens issued by List.
+const continuationTokenPrefix = "ctok-v1."
+
+func encodeContinuationToken(lastKey string) string {
+	return continuationTokenPrefix + base64.RawURLEncoding.EncodeToString([]byte(lastKey))
+}
+
+func decodeContinuationToken(tok string) (string, error) {
+	if !strings.HasPrefix(tok, continuationTokenPrefix) {
+		return "", &Error{Op: "List", StatusCode: 400, Code: "InvalidContinuationToken",
+			Message: "continuation token was not issued by this backend (tokens are opaque; never synthesize them from keys)", Retryable: false}
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(tok, continuationTokenPrefix))
+	if err != nil {
+		return "", &Error{Op: "List", StatusCode: 400, Code: "InvalidContinuationToken",
+			Message: "malformed continuation token", Retryable: false}
+	}
+	return string(raw), nil
 }
