@@ -101,10 +101,10 @@ func TestListDeadAllShardsPagination(t *testing.T) {
 		if len(items) > limit {
 			t.Fatalf("page %d returned %d items, limit %d", page, len(items), limit)
 		}
-		got = append(got, items...)
-		if next == "" {
+		if len(items) == 0 {
 			break
 		}
+		got = append(got, items...)
 		cursor = next
 	}
 
@@ -146,13 +146,13 @@ func TestListDeadAllShardsLimitOne(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListDead: %v", err)
 		}
+		if len(items) == 0 {
+			break
+		}
 		if len(items) != 1 {
 			t.Fatalf("Limit=1 returned %d items", len(items))
 		}
 		got = append(got, items...)
-		if next == "" {
-			break
-		}
 		cursor = next
 	}
 	if len(got) != 6 {
@@ -206,8 +206,18 @@ func TestListDeadAllShardsExhaustion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListDead: %v", err)
 	}
-	if len(items) != 9 || cursor != "" {
+	if len(items) != 9 || cursor == "" {
 		t.Fatalf("first pass: %d items, cursor=%q", len(items), cursor)
+	}
+
+	// Replaying the terminal cursor must return an empty page with an
+	// empty cursor.
+	items2, cursor2, err := q.ListDead(ctx, ListDeadOptions{StartAfter: cursor, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListDead terminal: %v", err)
+	}
+	if len(items2) != 0 || cursor2 != "" {
+		t.Fatalf("terminal pass: %d items, cursor=%q", len(items2), cursor2)
 	}
 }
 

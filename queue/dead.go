@@ -46,7 +46,12 @@ type DeadItem struct {
 }
 
 // ListDead returns dead-lettered jobs in ascending dead timestamp order.
-// The returned next cursor should be passed as StartAfter on the next call.
+//
+// Pagination protocol: pass the returned cursor as StartAfter on the next
+// call. A non-empty page always comes with a non-empty cursor; the walk is
+// complete when a call returns an empty page (the cursor is then "").
+// An empty StartAfter begins a fresh walk. Listing never removes markers;
+// a fresh walk over unchanged state returns the same items again.
 func (q *Queue) ListDead(ctx context.Context, opts ListDeadOptions) ([]DeadItem, string, error) {
 	start := time.Now()
 	limit := opts.Limit
@@ -364,9 +369,12 @@ func (q *Queue) listDeadAllShards(ctx context.Context, cursorStr string, limit i
 		}
 	}
 
-	nextCursor, err := q.encodeDeadCursor(iters, h)
-	if err != nil {
-		return nil, "", err
+	var nextCursor string
+	if len(items) > 0 {
+		nextCursor, err = q.encodeDeadCursor(iters, h)
+		if err != nil {
+			return nil, "", err
+		}
 	}
 	return items, nextCursor, nil
 }
@@ -405,6 +413,9 @@ func (q *Queue) parseDeadCursor(cursorStr string) ([]shardCursor, error) {
 				return nil, fmt.Errorf("queue: invalid suffix in ListDead cursor: %q", sc.Suffix)
 			}
 		}
+		if sc.Done && sc.Next != nil {
+			return nil, fmt.Errorf("queue: invalid ListDead cursor: shard %q both done and pending", shardStr)
+		}
 		var pending *DeadItem
 		if sc.Next != nil {
 			if sc.Next.ID == "" || sc.Next.When < 0 {
@@ -423,35 +434,34 @@ func (q *Queue) parseDeadCursor(cursorStr string) ([]shardCursor, error) {
 
 // encodeDeadCursor builds the opaque cursor that records how far each shard
 // advanced, including shards whose next candidate was fetched but not yet
-// returned. When every shard that has been touched is done and there are no
-// pending candidates, the returned cursor is empty to signal exhaustion.
+// returned. A non-empty page always produces a non-empty cursor, even when
+// every touched shard is fully drained; replaying that terminal cursor yields
+// an empty page with an empty cursor. An empty cursor is returned only when
+// the page itself contained no items at all.
 func (q *Queue) encodeDeadCursor(iters []*deadShardIter, h *deadMergeHeap) (string, error) {
 	pending := make(map[uint16]DeadItem, h.Len())
 	for _, node := range *h {
 		pending[node.it.shard] = node.item
 	}
 	m := make(map[string]deadCursorShard, len(iters))
-	allDone := true
 	for _, it := range iters {
 		key := shardHex(it.shard)
 		pend, hasPending := pending[it.shard]
 		touched := it.started || hasPending || it.lastSuffix != ""
 		if !touched {
-			allDone = false
 			continue
 		}
 		if it.done() && !hasPending {
 			m[key] = deadCursorShard{Done: true}
 			continue
 		}
-		allDone = false
 		sc := deadCursorShard{Suffix: it.lastSuffix}
 		if hasPending {
 			sc.Next = &deadCursorNext{When: pend.When.UnixMicro(), ID: pend.ID}
 		}
 		m[key] = sc
 	}
-	if (allDone && len(m) > 0) || len(m) == 0 {
+	if len(m) == 0 {
 		return "", nil
 	}
 	c := deadCursorV1{Version: 1, Shards: m}
