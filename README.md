@@ -114,10 +114,11 @@ fmt.Printf("entry: size=%d rev=%d\n", ent.Meta.SizeBytes, ent.Revision)
 
 ```go
 be := s3backend.NewMemory()
-q, err := queue.New(be, "tasks", func(o *queue.Options) {
-    o.WorkerID = "worker-1"
-    o.Shards = 16
-})
+q, err := queue.New(be, "tasks",
+    queue.WithWorkerID("worker-1"),
+    queue.WithShards(16),
+    queue.WithDefaultVisibilityTimeout(30*time.Second),
+)
 if err != nil {
     log.Fatal(err)
 }

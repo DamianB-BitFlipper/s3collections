@@ -832,8 +832,21 @@ func TestListDeadDenseShardPagination(t *testing.T) {
 	if len(items2) != total-limit {
 		t.Fatalf("second page len = %d, want %d", len(items2), total-limit)
 	}
-	if cursor2 != "" {
-		t.Fatalf("expected empty cursor after second page, got %q", cursor2)
+	// The second page is short but non-empty, so its cursor is non-empty
+	// (terminal form); replaying it must yield an empty page and "".
+	if cursor2 == "" {
+		t.Fatal("expected non-empty cursor after second page")
+	}
+	items3, cursor3, err := q.ListDead(ctx, ListDeadOptions{
+		Shards:     []uint16{shard},
+		Limit:      limit,
+		StartAfter: cursor2,
+	})
+	if err != nil {
+		t.Fatalf("ListDead third page: %v", err)
+	}
+	if len(items3) != 0 || cursor3 != "" {
+		t.Fatalf("third page = %d items, cursor %q; want 0 items, empty cursor", len(items3), cursor3)
 	}
 	if items2[0].When.Before(items[limit-1].When) {
 		t.Fatal("second page starts before first page ended")
@@ -906,25 +919,35 @@ func TestClaimConflictMetric(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	// Release multiple workers at once so they race for the single job.
-	barrier := make(chan struct{})
-	var wg sync.WaitGroup
-	for i := 0; i < 16; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-barrier
-			job, err := q.Claim(ctx, ClaimOptions{})
-			if err == nil {
-				_ = job.Complete(ctx)
-			}
-		}()
+	// A claim conflict requires two workers to lose the CAS race for the
+	// same job; whether a late worker observes state=claimed (skip, no
+	// conflict) or overlaps on the CAS (conflict) is timing-dependent, so
+	// run bounded rounds of races until a conflict is observed.
+	const rounds = 50
+	for r := 0; r < rounds; r++ {
+		if _, _, err := q.Enqueue(ctx, []byte("x"), EnqueueOptions{}); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		barrier := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < 32; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-barrier
+				job, err := q.Claim(ctx, ClaimOptions{})
+				if err == nil {
+					_ = job.Complete(ctx)
+				}
+			}()
+		}
+		close(barrier)
+		wg.Wait()
+		if got := meter.CounterSum("s3collections_conflicts_total"); got >= 1 {
+			return
+		}
 	}
-	close(barrier)
-	wg.Wait()
-	if got := meter.CounterSum("s3collections_conflicts_total"); got < 1 {
-		t.Fatalf("conflicts_total = %v, want >= 1", got)
-	}
+	t.Fatalf("no claim conflict observed in %d rounds", rounds)
 }
 
 func TestListDeadEmitsListPagesMetric(t *testing.T) {

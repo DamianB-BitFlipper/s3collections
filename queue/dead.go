@@ -1,9 +1,11 @@
 package queue
 
 import (
+	"container/heap"
 	"context"
+	"encoding/json"
 	"errors"
-	"sort"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -15,8 +17,10 @@ import (
 // ListDeadOptions configures ListDead.
 type ListDeadOptions struct {
 	// StartAfter is an opaque cursor. When Shards contains exactly one
-	// element, it refers to a marker suffix "dead/<ts>/<jobID>". When Shards
-	// is empty it has the form "<shard>/<ts>/<jobID>".
+	// element, it refers to a marker suffix "<ts>/<jobID>" relative to the
+	// shard's dead/ prefix. When Shards is empty, StartAfter is an opaque
+	// JSON cursor produced by a previous all-shard ListDead call and must
+	// not be synthesized by callers.
 	StartAfter string
 
 	// Limit caps the number of items returned. Defaults to 1000.
@@ -56,8 +60,10 @@ func (q *Queue) ListDead(ctx context.Context, opts ListDeadOptions) ([]DeadItem,
 	var err error
 	if len(opts.Shards) == 1 {
 		items, next, err = q.listDeadSingleShard(ctx, opts.Shards[0], opts.StartAfter, limit, now)
-	} else {
+	} else if len(opts.Shards) == 0 {
 		items, next, err = q.listDeadAllShards(ctx, opts.StartAfter, limit, now)
+	} else {
+		err = errors.New("queue: ListDead supports exactly one shard or all shards")
 	}
 	if err != nil {
 		q.observeLatency(ctx, "list_dead", outcomeError, time.Since(start))
@@ -77,6 +83,7 @@ func (q *Queue) listDeadSingleShard(ctx context.Context, shard uint16, startAfte
 	}
 	items := make([]DeadItem, 0, limit)
 	var next string
+	var lastSuffix string // suffix of the last marker page consumed
 	opts := &s3backend.ListOptions{
 		StartAfter: startAfter,
 		MaxKeys:    limit,
@@ -94,15 +101,15 @@ func (q *Queue) listDeadSingleShard(ctx context.Context, shard uint16, startAfte
 			return nil, "", err
 		}
 		items = append(items, chunk...)
+		if len(page.Objects) > 0 {
+			lastSuffix = strings.TrimPrefix(page.Objects[len(page.Objects)-1].Key, prefix)
+		}
 		if !page.IsTruncated {
 			break
 		}
 		if len(items) >= limit {
 			// Enough items; cursor resumes after the last object in this page.
-			if len(page.Objects) > 0 {
-				last := page.Objects[len(page.Objects)-1].Key
-				next = strings.TrimPrefix(last, prefix)
-			}
+			next = lastSuffix
 			break
 		}
 		// Continue with the opaque continuation token issued by the backend.
@@ -116,80 +123,343 @@ func (q *Queue) listDeadSingleShard(ctx context.Context, shard uint16, startAfte
 	if len(items) > limit {
 		items = items[:limit]
 	}
+	if next == "" && len(items) > 0 {
+		// Cursor protocol (see encodeDeadCursor): a non-empty page always
+		// yields a non-empty cursor. The walk drained exactly at the end of
+		// this page, so resume after the last consumed marker; replaying
+		// that cursor returns an empty page with an empty cursor.
+		next = lastSuffix
+	}
 	return items, next, nil
 }
 
-func (q *Queue) listDeadAllShards(ctx context.Context, startAfterCursor string, limit int, now time.Time) ([]DeadItem, string, error) {
-	startShard := uint16(0)
-	startSuffix := ""
-	if startAfterCursor != "" {
-		parts := strings.SplitN(startAfterCursor, "/", 2)
-		if len(parts) >= 1 {
-			n, err := strconv.ParseUint(parts[0], 16, 16)
-			if err == nil {
-				startShard = uint16(n)
-				if len(parts) == 2 {
-					startSuffix = parts[1]
-				}
+// deadCursorV1 is the JSON form of the opaque all-shards ListDead cursor.
+// It records, for every shard that has been touched, the suffix of the last
+// returned marker and (if already fetched but not yet returned) the next
+// pending candidate. A shard marked done has no further markers. Shards
+// absent from the map are started from the beginning.
+type deadCursorV1 struct {
+	Version int                        `json:"v"`
+	Shards  map[string]deadCursorShard `json:"s,omitempty"`
+}
+
+type deadCursorShard struct {
+	Done   bool            `json:"done,omitempty"`
+	Suffix string          `json:"suffix,omitempty"`
+	Next   *deadCursorNext `json:"next,omitempty"`
+}
+
+type deadCursorNext struct {
+	When int64  `json:"t"`
+	ID   string `json:"id"`
+}
+
+// deadShardIter pages one shard's dead/ prefix and yields DeadItem values
+// in marker-key order. It never synthesizes backend continuation tokens.
+type deadShardIter struct {
+	q        *Queue
+	ctx      context.Context
+	shard    uint16
+	prefix   string
+	pageSize int
+
+	startAfter string // used for the first page only
+	contToken  string // opaque backend continuation token; empty means no further pages
+	started    bool   // true once the first page has been fetched
+
+	page       []s3backend.ObjectInfo
+	pos        int
+	lastSuffix string // suffix of the last consumed marker, empty if none
+}
+
+// fill fetches the next page if the current buffer is empty. It never
+// synthesizes continuation tokens.
+func (it *deadShardIter) fill() error {
+	if it.pos < len(it.page) {
+		return nil
+	}
+	if it.started && it.contToken == "" {
+		return nil
+	}
+	opts := &s3backend.ListOptions{MaxKeys: it.pageSize}
+	if it.contToken != "" {
+		opts.ContinuationToken = it.contToken
+	} else if it.startAfter != "" {
+		opts.StartAfter = it.startAfter
+	}
+	page, err := it.q.listWithRetry(it.ctx, "list_dead", deadPrefixTemplate, it.prefix, opts)
+	if err != nil {
+		return err
+	}
+	it.started = true
+	it.startAfter = ""
+	it.page = page.Objects
+	it.pos = 0
+	if page.IsTruncated {
+		it.contToken = page.NextContinuationToken
+	} else {
+		it.contToken = ""
+	}
+	return nil
+}
+
+// done reports whether this shard has no more candidates. An iterator with
+// an unconsumed item in its current page is not done.
+func (it *deadShardIter) done() bool {
+	return it.started && it.pos >= len(it.page) && it.contToken == ""
+}
+
+// next returns the next valid dead item from this shard, skipping orphan or
+// malformed markers. The iterator's lastSuffix is advanced past skipped keys
+// so that resume points never revisit them.
+func (it *deadShardIter) next() (DeadItem, bool, error) {
+	for {
+		if err := it.fill(); err != nil {
+			return DeadItem{}, false, err
+		}
+		if it.pos >= len(it.page) {
+			return DeadItem{}, false, nil
+		}
+		info := it.page[it.pos]
+		it.pos++
+		suffix := strings.TrimPrefix(info.Key, it.prefix)
+		if suffix == info.Key {
+			// Should not happen: key was returned under prefix.
+			it.lastSuffix = ""
+			continue
+		}
+		_, kind, when, jobID, ok := it.q.parseMarker(info.Key)
+		if !ok || kind != "dead" {
+			it.lastSuffix = suffix
+			continue
+		}
+		appKey := jobAppKey(it.shard, jobID)
+		rec, err := it.q.store.Get(it.ctx, appKey)
+		if err != nil {
+			if errors.Is(err, cas.ErrNotFound) {
+				// Orphan marker; skip and advance past it.
+				it.lastSuffix = suffix
+				continue
 			}
+			return DeadItem{}, false, err
+		}
+		env, err := decodeJob(rec.Value)
+		if err != nil {
+			return DeadItem{}, false, err
+		}
+		reason := ""
+		if env.Dead != nil {
+			reason = env.Dead.Reason
+		}
+		it.lastSuffix = suffix
+		return DeadItem{
+			ID:       jobID,
+			Shard:    it.shard,
+			When:     when,
+			Attempts: env.Attempts,
+			Reason:   reason,
+		}, true, nil
+	}
+}
+
+// deadHeapNode is one candidate in the k-way merge.
+type deadHeapNode struct {
+	item DeadItem
+	it   *deadShardIter
+}
+
+type deadMergeHeap []deadHeapNode
+
+func (h deadMergeHeap) Len() int { return len(h) }
+func (h deadMergeHeap) Less(i, j int) bool {
+	if h[i].item.When.Equal(h[j].item.When) {
+		return h[i].item.ID < h[j].item.ID
+	}
+	return h[i].item.When.Before(h[j].item.When)
+}
+func (h deadMergeHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *deadMergeHeap) Push(x any)   { *h = append(*h, x.(deadHeapNode)) }
+func (h *deadMergeHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+func (q *Queue) listDeadAllShards(ctx context.Context, cursorStr string, limit int, now time.Time) ([]DeadItem, string, error) {
+	shardCursors, err := q.parseDeadCursor(cursorStr)
+	if err != nil {
+		return nil, "", err
+	}
+	// One item per page keeps the per-shard iterator state simple: the
+	// cursor can record a single pending candidate per shard without also
+	// having to snapshot the rest of a partially consumed page.
+	const pageSize = 1
+
+	iters := make([]*deadShardIter, q.opts.Shards)
+	for s := uint16(0); s < q.opts.Shards; s++ {
+		sc := shardCursors[s]
+		prefix := q.prefix + "shard/" + shardHex(s) + "/dead/"
+		var startAfter string
+		if sc.suffix != "" {
+			startAfter = prefix + sc.suffix
+		}
+		iters[s] = &deadShardIter{
+			q:          q,
+			ctx:        ctx,
+			shard:      s,
+			prefix:     prefix,
+			pageSize:   pageSize,
+			startAfter: startAfter,
+		}
+		if sc.done {
+			iters[s].started = true
+			iters[s].contToken = ""
+			iters[s].page = nil
+			iters[s].pos = 0
 		}
 	}
 
-	pageSize := limit
-	if pageSize <= 0 || pageSize > 1000 {
-		pageSize = 1000
-	}
-	if pageSize < 1 {
-		pageSize = 1
+	h := &deadMergeHeap{}
+	heap.Init(h)
+	for s, it := range iters {
+		sc := shardCursors[s]
+		if sc.pending != nil && !sc.done {
+			// The pending candidate was fetched from S3 by the previous
+			// call but not returned (a heap node surviving the limit cut).
+			// Position the iterator past it so the next fill() resumes
+			// after the pending key rather than re-fetching it.
+			pendSuffix := ts20(sc.pending.When) + "/" + sc.pending.ID
+			it.startAfter = it.prefix + pendSuffix
+			it.lastSuffix = pendSuffix
+			heap.Push(h, deadHeapNode{
+				item: *sc.pending,
+				it:   it,
+			})
+			continue
+		}
+		if it.done() {
+			continue
+		}
+		item, ok, err := it.next()
+		if err != nil {
+			return nil, "", err
+		}
+		if ok {
+			heap.Push(h, deadHeapNode{item: item, it: it})
+		}
 	}
 
 	items := make([]DeadItem, 0, limit)
-	for s := startShard; s < q.opts.Shards; s++ {
-		prefix := q.prefix + "shard/" + shardHex(s) + "/dead/"
-		startAfter := ""
-		if s == startShard && startSuffix != "" {
-			startAfter = prefix + startSuffix
+	for h.Len() > 0 && len(items) < limit {
+		node := heap.Pop(h).(deadHeapNode)
+		items = append(items, node.item)
+		nextItem, ok, err := node.it.next()
+		if err != nil {
+			return nil, "", err
 		}
-		contToken := ""
-		for {
-			opts := &s3backend.ListOptions{MaxKeys: pageSize}
-			if contToken != "" {
-				opts.ContinuationToken = contToken
-			} else if startAfter != "" {
-				opts.StartAfter = startAfter
-			}
-			page, err := q.listWithRetry(ctx, "list_dead", deadPrefixTemplate, prefix, opts)
-			if err != nil {
-				return nil, "", err
-			}
-			chunk, err := q.deadMarkersToItems(ctx, page.Objects, s, now)
-			if err != nil {
-				return nil, "", err
-			}
-			items = append(items, chunk...)
-			if !page.IsTruncated {
-				break
-			}
-			contToken = page.NextContinuationToken
-			startAfter = ""
-			if contToken == "" {
-				break
-			}
+		if ok {
+			heap.Push(h, deadHeapNode{item: nextItem, it: node.it})
 		}
 	}
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].When.Equal(items[j].When) {
-			return items[i].ID < items[j].ID
-		}
-		return items[i].When.Before(items[j].When)
-	})
-	var next string
-	if len(items) > limit {
-		last := items[limit-1]
-		next = shardHex(last.Shard) + "/dead/" + ts20(last.When) + "/" + last.ID
-		items = items[:limit]
+
+	nextCursor, err := q.encodeDeadCursor(iters, h)
+	if err != nil {
+		return nil, "", err
 	}
-	return items, next, nil
+	return items, nextCursor, nil
+}
+
+type shardCursor struct {
+	suffix  string
+	done    bool
+	pending *DeadItem
+}
+
+// parseDeadCursor decodes an all-shards ListDead cursor. An empty cursor
+// means "start from the beginning".
+func (q *Queue) parseDeadCursor(cursorStr string) ([]shardCursor, error) {
+	out := make([]shardCursor, q.opts.Shards)
+	if cursorStr == "" {
+		return out, nil
+	}
+	var c deadCursorV1
+	if err := json.Unmarshal([]byte(cursorStr), &c); err != nil {
+		return nil, fmt.Errorf("queue: invalid ListDead cursor: %w", err)
+	}
+	if c.Version != 1 {
+		return nil, fmt.Errorf("queue: unsupported ListDead cursor version %d", c.Version)
+	}
+	for shardStr, sc := range c.Shards {
+		n, err := strconv.ParseUint(shardStr, 16, 16)
+		if err != nil || n >= uint64(q.opts.Shards) {
+			return nil, fmt.Errorf("queue: invalid shard in ListDead cursor: %q", shardStr)
+		}
+		if sc.Suffix != "" {
+			parts := strings.Split(sc.Suffix, "/")
+			if len(parts) != 2 || len(parts[0]) != 20 || parts[1] == "" {
+				return nil, fmt.Errorf("queue: invalid suffix in ListDead cursor: %q", sc.Suffix)
+			}
+			if _, err := strconv.ParseInt(parts[0], 10, 64); err != nil {
+				return nil, fmt.Errorf("queue: invalid suffix in ListDead cursor: %q", sc.Suffix)
+			}
+		}
+		var pending *DeadItem
+		if sc.Next != nil {
+			if sc.Next.ID == "" || sc.Next.When < 0 {
+				return nil, fmt.Errorf("queue: invalid next candidate in ListDead cursor")
+			}
+			pending = &DeadItem{
+				ID:    sc.Next.ID,
+				Shard: uint16(n),
+				When:  time.UnixMicro(sc.Next.When).UTC(),
+			}
+		}
+		out[n] = shardCursor{suffix: sc.Suffix, done: sc.Done, pending: pending}
+	}
+	return out, nil
+}
+
+// encodeDeadCursor builds the opaque cursor that records how far each shard
+// advanced, including shards whose next candidate was fetched but not yet
+// returned. When every shard that has been touched is done and there are no
+// pending candidates, the returned cursor is empty to signal exhaustion.
+func (q *Queue) encodeDeadCursor(iters []*deadShardIter, h *deadMergeHeap) (string, error) {
+	pending := make(map[uint16]DeadItem, h.Len())
+	for _, node := range *h {
+		pending[node.it.shard] = node.item
+	}
+	m := make(map[string]deadCursorShard, len(iters))
+	allDone := true
+	for _, it := range iters {
+		key := shardHex(it.shard)
+		pend, hasPending := pending[it.shard]
+		touched := it.started || hasPending || it.lastSuffix != ""
+		if !touched {
+			allDone = false
+			continue
+		}
+		if it.done() && !hasPending {
+			m[key] = deadCursorShard{Done: true}
+			continue
+		}
+		allDone = false
+		sc := deadCursorShard{Suffix: it.lastSuffix}
+		if hasPending {
+			sc.Next = &deadCursorNext{When: pend.When.UnixMicro(), ID: pend.ID}
+		}
+		m[key] = sc
+	}
+	if (allDone && len(m) > 0) || len(m) == 0 {
+		return "", nil
+	}
+	c := deadCursorV1{Version: 1, Shards: m}
+	b, err := json.Marshal(c)
+	if err != nil {
+		return "", fmt.Errorf("queue: encode ListDead cursor: %w", err)
+	}
+	return string(b), nil
 }
 
 func (q *Queue) deadMarkersToItems(ctx context.Context, objects []s3backend.ObjectInfo, shard uint16, now time.Time) ([]DeadItem, error) {

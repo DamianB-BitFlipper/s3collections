@@ -150,6 +150,7 @@ func (s *Store) processShard(ctx context.Context, shard, tick int) {
 		}
 		e, err := parseEntry(rec.Value)
 		if err != nil {
+			s.incCounter(ctx, metricCorrupt, 1)
 			continue
 		}
 
