@@ -1,7 +1,7 @@
 # s3collections
 
-`s3collections` implements a compare-and-swap store, an LRU metadata index,
-and an at-least-once work queue on top of S3-compatible object storage. It is
+`s3collections` implements immutable blob/tree primitives, a compare-and-swap
+store, an LRU metadata index, and an at-least-once work queue on top of S3-compatible object storage. It is
 for stateless Go services that already have a bucket and can accept
 object-storage latency in exchange for not operating another database.
 
@@ -13,6 +13,7 @@ AWS Signature Version 4.
 
 | Package | Use it for |
 | --- | --- |
+| [`tree`](tree/) | Content-addressed blobs and immutable tree nodes, named refs, traversal, leases, and reachability GC. |
 | [`cas`](cas/) | Versioned records with atomic create, update, and delete per key. |
 | [`lru`](lru/) | Distributed metadata for a bounded cache, with sharded CLOCK eviction. The cached objects themselves live elsewhere. |
 | [`queue`](queue/) | Durable, at-least-once jobs with leases, retries, dead letters, and idempotent enqueue. |
@@ -68,6 +69,43 @@ be := s3backend.NewMemory()
 
 The examples below assume `be` is configured and `ctx` is a live
 `context.Context`.
+
+## Immutable blobs and trees
+
+`tree.Store` provides storage primitives rather than VM-specific snapshot
+semantics. Blob bytes are content-addressed by SHA-256. Nodes contain parent
+pointers, blob references, and opaque metadata; a branch-factor-one tree is a
+list. Named refs are mutable branch/tag heads updated separately from commits.
+
+```go
+store, err := tree.New(be, "snapshots")
+if err != nil { log.Fatal(err) }
+
+sum := sha256.Sum256(payload)
+blob, err := store.PutBlob(ctx, tree.BlobID(hex.EncodeToString(sum[:])),
+    bytes.NewReader(payload), tree.WithExpectedBlobSize(int64(len(payload))))
+if err != nil { log.Fatal(err) }
+
+root, err := store.CommitRoot(ctx, []tree.BlobRef{blob}, opaqueMetadata)
+if err != nil { log.Fatal(err) }
+head, err := store.CreateRef(ctx, "branches/main", root)
+if err != nil { log.Fatal(err) }
+
+child, err := store.CommitChild(ctx, root, nil, nextOpaqueMetadata)
+if err != nil { log.Fatal(err) }
+_, err = store.CompareAndSwapRef(ctx, head.Name, head.Revision, child)
+```
+
+`ResolveLineage` follows authoritative parent pointers from a node to its root.
+`ListChildren` uses advisory reverse-edge markers and is eventually consistent.
+Refs and active leases are the durable roots for reachability GC. Run
+`PlanGC`, wait its grace period, then pass the unchanged plan to `SweepGC`.
+There is deliberately no public node-delete operation.
+
+Full blob reads verify SHA-256 at EOF. Range reads validate the returned byte
+count but cannot validate the full-object hash without downloading the full
+object. Encoding, compression, and encryption descriptors are opaque; callers
+perform transformations and key management.
 
 ## CAS
 
@@ -248,6 +286,7 @@ The test writes below a unique prefix and removes the objects it creates.
 Runnable examples using the in-memory backend are in [`examples/`](examples/):
 
 ```sh
+go run ./examples/treedemo
 go run ./examples/casdemo
 go run ./examples/lrudemo
 go run ./examples/queuedemo

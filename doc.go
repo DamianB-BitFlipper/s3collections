@@ -1,6 +1,7 @@
 // Package s3collections provides distributed data structures backed solely
-// by S3: a versioned compare-and-swap store (package cas), a distributed LRU
-// metadata store (package lru), and a durable work queue (package queue).
+// by S3: immutable blob and tree primitives (package tree), a versioned
+// compare-and-swap store (package cas), a distributed LRU metadata store
+// (package lru), and a durable work queue (package queue).
 //
 // This root package defines the shared plumbing used by every component:
 // observability interfaces (Meter, Logger, Tracer), retry policy, and test

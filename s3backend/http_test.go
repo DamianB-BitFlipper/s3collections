@@ -35,10 +35,11 @@ type fakeS3Object struct {
 }
 
 type fakeS3Request struct {
-	Method string
-	Path   string
-	Query  url.Values
-	Header http.Header
+	Method        string
+	Path          string
+	Query         url.Values
+	Header        http.Header
+	ContentLength int64
 }
 
 func newFakeS3() *fakeS3 {
@@ -49,10 +50,11 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requests = append(f.requests, fakeS3Request{
-		Method: r.Method,
-		Path:   r.URL.Path,
-		Query:  r.URL.Query(),
-		Header: r.Header.Clone(),
+		Method:        r.Method,
+		Path:          r.URL.Path,
+		Query:         r.URL.Query(),
+		Header:        r.Header.Clone(),
+		ContentLength: r.ContentLength,
 	})
 
 	rest := strings.TrimPrefix(r.URL.Path, "/")
@@ -87,7 +89,9 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		f.put(w, r, key)
 	case http.MethodGet:
-		f.get(w, key)
+		f.get(w, r, key)
+	case http.MethodHead:
+		f.head(w, key)
 	case http.MethodDelete:
 		f.delete(w, key)
 	default:
@@ -118,7 +122,7 @@ func (f *fakeS3) put(w http.ResponseWriter, r *http.Request, key string) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (f *fakeS3) get(w http.ResponseWriter, key string) {
+func (f *fakeS3) head(w http.ResponseWriter, key string) {
 	o, ok := f.objects[key]
 	if !ok {
 		f.writeError(w, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.")
@@ -126,6 +130,40 @@ func (f *fakeS3) get(w http.ResponseWriter, key string) {
 	}
 	w.Header().Set("ETag", `"`+o.etag+`"`)
 	w.Header().Set("Last-Modified", o.modTime.Format(http.TimeFormat))
+	w.Header().Set("Content-Length", strconv.Itoa(len(o.body)))
+	w.WriteHeader(http.StatusOK)
+}
+
+func (f *fakeS3) get(w http.ResponseWriter, r *http.Request, key string) {
+	o, ok := f.objects[key]
+	if !ok {
+		f.writeError(w, http.StatusNotFound, "NoSuchKey", "The specified key does not exist.")
+		return
+	}
+	w.Header().Set("ETag", `"`+o.etag+`"`)
+	w.Header().Set("Last-Modified", o.modTime.Format(http.TimeFormat))
+	// Support Range requests (bytes=start-end).
+	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" {
+		if strings.HasPrefix(rangeHdr, "bytes=") {
+			spec := rangeHdr[6:]
+			dash := strings.IndexByte(spec, '-')
+			if dash > 0 {
+				start, err1 := strconv.ParseInt(spec[:dash], 10, 64)
+				end, err2 := strconv.ParseInt(spec[dash+1:], 10, 64)
+				if err1 == nil && err2 == nil && start >= 0 && end >= start && start < int64(len(o.body)) {
+					if end >= int64(len(o.body)) {
+						end = int64(len(o.body)) - 1
+					}
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(o.body)))
+					w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+					w.WriteHeader(http.StatusPartialContent)
+					w.Write(o.body[start : end+1])
+					return
+				}
+			}
+		}
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(int64(len(o.body)), 10))
 	w.WriteHeader(http.StatusOK)
 	w.Write(o.body)
 }
