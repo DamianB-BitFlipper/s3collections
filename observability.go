@@ -20,7 +20,7 @@ func L(key, value string) Label { return Label{Key: key, Value: value} }
 // for concurrent use. A nil Meter in component options means no metrics.
 //
 // The stable metric names emitted by this module are listed in
-// docs/design/04-consolidation.md (D10); adapters for Prometheus, OTel, etc.
+// docs/reference.md; adapters for Prometheus, OTel, etc.
 // are implemented in user code by translating these calls.
 type Meter interface {
 	IncCounter(ctx context.Context, name string, delta float64, labels ...Label)

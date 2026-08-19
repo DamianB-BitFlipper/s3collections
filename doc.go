@@ -7,7 +7,7 @@
 // helpers. It has no third-party dependencies; the whole module uses only
 // the Go standard library.
 //
-// Consistency model (see docs/design/00-architecture.md): every structure
+// Consistency model (see docs/reference.md): every structure
 // relies only on strong read-after-write GET/LIST, atomic per-key PUT, and
 // conditional PUT (If-None-Match / If-Match). Single-key operations are
 // linearizable; cross-key invariants are best-effort with background repair.

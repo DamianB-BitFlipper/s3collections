@@ -14,8 +14,7 @@ import (
 // TestHTTPIntegration exercises the full Backend contract against a real S3
 // endpoint (AWS S3, MinIO, or another S3-compatible store).
 //
-// Configuration comes from the environment (see
-// docs/design/00-architecture.md §5.5):
+// Configuration comes from the environment (see docs/reference.md):
 //
 //	S3_ENDPOINT          e.g. https://s3.us-east-1.amazonaws.com or http://localhost:9000
 //	S3_REGION            e.g. us-east-1
@@ -41,7 +40,7 @@ func TestHTTPIntegration(t *testing.T) {
 		cfg.AccessKey == "" || cfg.SecretKey == "" {
 		t.Skip("S3_ENDPOINT/S3_REGION/S3_BUCKET/S3_ACCESS_KEY/S3_SECRET_KEY not set")
 	}
-	// Unique root per run (00-architecture.md §5.5).
+	// Use a unique root per run.
 	cfg.Prefix = fmt.Sprintf("it/%s-%d/", time.Now().UTC().Format(time.RFC3339Nano), os.Getpid())
 
 	c, err := NewHTTPClient(cfg)
