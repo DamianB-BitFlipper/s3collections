@@ -72,13 +72,12 @@ The examples below assume `be` is configured and `ctx` is a live
 
 ## Immutable blobs and trees
 
-`tree.Store` provides storage primitives rather than VM-specific snapshot
-semantics. Blob bytes are content-addressed by SHA-256. Nodes contain parent
-pointers, blob references, and opaque metadata; a branch-factor-one tree is a
-list. Named refs are mutable branch/tag heads updated separately from commits.
+`tree.Store` provides general-purpose storage primitives. Blob bytes are
+content-addressed by SHA-256. Nodes contain parent pointers, blob references,
+and opaque metadata; a branch-factor-one tree is a list. Named refs are mutable branch/tag heads updated separately from commits.
 
 ```go
-store, err := tree.New(be, "snapshots")
+store, err := tree.New(be, "objects")
 if err != nil { log.Fatal(err) }
 
 sum := sha256.Sum256(payload)
