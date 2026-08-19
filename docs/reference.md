@@ -68,8 +68,10 @@ client, err := s3backend.NewHTTPClient(s3backend.HTTPConfig{
 `PathStyle` for endpoints that use `/bucket/key` instead of
 `bucket.endpoint/key`.
 
-The client signs requests with SigV4 and supports `GetObject`, `PutObject`,
-`DeleteObject`, and `ListObjectsV2`. It does not perform retries; higher-level
+The client signs requests with SigV4 and supports `GetObject`, ranged and
+streaming reads, `HeadObject`, `PutObject`, standard multipart upload,
+`DeleteObject`, and `ListObjectsV2`. It does not use provider-specific append
+or write-offset extensions. It does not perform retries; higher-level
 packages retry errors for which `s3backend.IsRetryable(err)` is true. It uses
 static credentials and does not discover or refresh them.
 
@@ -93,6 +95,82 @@ chaos := s3backend.NewChaos(memory, s3backend.ChaosConfig{
 `Memory` implements the backend contract in process. `Chaos` wraps another
 backend and injects retryable failures, writes that succeed but report an
 error, and latency.
+
+## Immutable blob and tree store
+
+```go
+store, err := tree.New(backend, "snapshots", options...)
+```
+
+A store name scopes every key. Names and ref names are base64url-encoded before
+being used in object keys. Defaults allow blob payloads from 40 KiB through
+500 MiB.
+
+### Blobs
+
+```go
+ref, err := store.PutBlob(ctx, expectedSHA256, reader,
+    tree.WithExpectedBlobSize(size),
+    tree.WithEncodingDescriptor(encodingMetadata),
+    tree.WithEncryptionDescriptor(encryptionMetadata),
+    tree.WithBlobMetadata(opaqueMetadata))
+
+reader, err := store.GetBlob(ctx, ref, tree.WithRange(offset, length))
+stat, err := store.StatBlob(ctx, ref)
+```
+
+Blob identities are lowercase SHA-256 hex over the exact stored stream. Raw
+bytes and their immutable metadata manifest are separate objects; the manifest
+is published last. Retrying identical content is idempotent. Encoding,
+compression, and encryption descriptors are opaque bytes—this package does not
+compress, encrypt, or manage keys.
+
+Full reads verify byte count and SHA-256 when read to EOF. Range reads use one
+`Range` GET after validating the supplied `BlobRef`; they validate response
+bounds and length, but not the full-blob hash. Large HTTP writes use the
+portable S3 multipart protocol. Configure an AbortIncompleteMultipartUpload
+lifecycle rule as defense in depth for uploads abandoned before an upload ID
+can be recovered.
+
+### Immutable nodes and refs
+
+```go
+root, err := store.CommitRoot(ctx, payloadRefs, opaqueMetadata)
+child, err := store.CommitChild(ctx, root, payloadRefs, opaqueMetadata)
+node, err := store.GetNode(ctx, child)
+
+head, err := store.CreateRef(ctx, "branches/main", root)
+head, err = store.CompareAndSwapRef(ctx, head.Name, head.Revision, child)
+err = store.DeleteRef(ctx, head.Name, head.Revision)
+```
+
+Node IDs hash canonical manifests. A root encodes both parent and root as JSON
+`null`; `Root(rootID)` returns `rootID`. Child commit verifies its parent
+lineage and every referenced blob before publishing the node. Committing a node
+and advancing a named ref are separate operations. Ref deletion is a
+revisioned tombstone because portable S3 has no conditional delete.
+
+### Topology
+
+`ResolveLineage` returns root/boundary through target. Its optional stop
+predicate lets callers interpret opaque metadata without embedding VM semantics
+in this package. `Root`, `IsAncestor`, and `LowestCommonAncestor` use only
+parent pointers. `ListChildren` uses advisory reverse-edge objects; call
+`RepairEdges` to reconcile missing hints. Restore and GC never depend on them.
+
+### Leases and GC
+
+`AcquireLease`, `RenewLease`, and `ReleaseLease` use owner/token/fence data and
+conditional writes. Stale lease copies cannot renew or release newer fences.
+
+`PlanGC` marks from all live refs, active leases, caller-provided retained
+roots, recent commits, and recent blob publications. It returns a persisted
+plan of versioned candidates older than the cutoff. After `NotBefore`,
+`SweepGC` takes the store mutation gate, refreshes reachability, validates
+candidate versions/ages, and deletes unreachable nodes, blobs, and stale edge
+hints. There is no public `DeleteNode`. A failed process can leave the mutation
+gate held; operators can inspect `MutationGate` and, after establishing
+external exclusivity, use `RecoverMutationGate` with the expected fence.
 
 ## Compare-and-swap store
 

@@ -3,9 +3,11 @@
 package s3backend
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -72,6 +74,41 @@ func TestHTTPIntegration(t *testing.T) {
 			token = page.NextContinuationToken
 		}
 	})
+
+	// Optional large-object capabilities used by package tree.
+	streamData := bytes.Repeat([]byte("stream-range-"), 4096)
+	if err := c.PutStream(ctx, "stream", bytes.NewReader(streamData), int64(len(streamData)), &Preconditions{IfNoneMatch: true}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := c.Stat(ctx, "stream")
+	if err != nil || st.Size != int64(len(streamData)) {
+		t.Fatalf("stat=%#v err=%v", st, err)
+	}
+	ranged, err := c.GetRange(ctx, "stream", 7, 1234)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotRange, err := io.ReadAll(ranged.Body)
+	_ = ranged.Body.Close()
+	if err != nil || !bytes.Equal(gotRange, streamData[7:7+1234]) {
+		t.Fatalf("range len=%d err=%v", len(gotRange), err)
+	}
+	streamed, err := c.GetStream(ctx, "stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotStream, err := io.ReadAll(streamed.Body)
+	_ = streamed.Body.Close()
+	if err != nil || !bytes.Equal(gotStream, streamData) {
+		t.Fatalf("stream len=%d err=%v", len(gotStream), err)
+	}
+	multipartData := bytes.Repeat([]byte("multipart-"), 4096)
+	if err = c.PutMultipart(ctx, "multipart", bytes.NewReader(multipartData), int64(len(multipartData)), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, e := c.Get(ctx, "multipart"); e != nil || !bytes.Equal(got.Body, multipartData) {
+		t.Fatalf("multipart len=%d err=%v", len(got.Body), e)
+	}
 
 	// Get of a missing key: ErrNotFound.
 	if _, err := c.Get(ctx, "missing"); !errors.Is(err, ErrNotFound) {
