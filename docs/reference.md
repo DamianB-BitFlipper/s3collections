@@ -99,7 +99,7 @@ error, and latency.
 ## Immutable blob and tree store
 
 ```go
-store, err := tree.New(backend, "snapshots", options...)
+store, err := tree.New(backend, "objects", options...)
 ```
 
 A store name scopes every key. Names and ref names are base64url-encoded before
@@ -153,10 +153,11 @@ revisioned tombstone because portable S3 has no conditional delete.
 ### Topology
 
 `ResolveLineage` returns root/boundary through target. Its optional stop
-predicate lets callers interpret opaque metadata without embedding VM semantics
-in this package. `Root`, `IsAncestor`, and `LowestCommonAncestor` use only
-parent pointers. `ListChildren` uses advisory reverse-edge objects; call
-`RepairEdges` to reconcile missing hints. Restore and GC never depend on them.
+predicate lets callers interpret opaque metadata without embedding
+application-specific semantics in this package. `Root`, `IsAncestor`, and
+`LowestCommonAncestor` use only parent pointers. `ListChildren` uses advisory
+reverse-edge objects; call `RepairEdges` to reconcile missing hints. Traversal
+and GC never depend on them.
 
 ### Leases and GC
 
