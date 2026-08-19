@@ -5,8 +5,8 @@
 //
 // Blob bytes are stored raw and separately from their small metadata
 // manifests. Encoding and encryption descriptors are opaque bytes: this
-// package neither interprets nor transforms them. Application, VM, and
-// snapshot-full semantics deliberately remain outside this package.
+// package neither interprets nor transforms them. Application-specific
+// semantics deliberately remain outside this package.
 //
 // All durable coordination uses ordinary S3-compatible operations. The
 // package does not use append or write-offset extensions and works with AWS
