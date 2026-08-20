@@ -191,6 +191,8 @@ func (q *Queue) reapExpiredLease(ctx context.Context, shard uint16, jobID string
 		return
 	}
 
+	leaseToken := env.Lease.Token
+	leaseExpiry := env.Lease.Expiry
 	newNotBefore := env.NotBefore
 	if now.After(newNotBefore) {
 		newNotBefore = now
@@ -201,6 +203,9 @@ func (q *Queue) reapExpiredLease(ctx context.Context, shard uint16, jobID string
 			return nil, err
 		}
 		if curEnv.State != stateClaimed || curEnv.Lease == nil {
+			return cur.Value, nil
+		}
+		if curEnv.Lease.Token != leaseToken || !curEnv.Lease.Expiry.Equal(leaseExpiry) {
 			return cur.Value, nil
 		}
 		if curEnv.Lease.Expiry.After(deadline) {
@@ -246,7 +251,15 @@ func (q *Queue) backfillReadyMarkers(ctx context.Context, shard uint16) {
 				continue
 			}
 			env, err := decodeJob(rec.Value)
-			if err != nil || env.State != statePending {
+			if err != nil {
+				continue
+			}
+			if env.State == statePublishing {
+				// Resume a stale publishing job from a crashed prior attempt.
+				q.resumePublishing(ctx, shard, env.ID, env)
+				continue
+			}
+			if env.State != statePending {
 				continue
 			}
 			jobID := env.ID
@@ -350,6 +363,7 @@ func (q *Queue) gcPass(ctx context.Context) {
 	for i := int64(0); i < deletedDead.Load(); i++ {
 		q.recordReaperDeleted(ctx, "dead")
 	}
+	q.runPayloadGC(ctx)
 	q.observeLatency(ctx, "gc", outcomeSuccess, time.Since(start))
 	q.recordEvent(ctx, "gc", outcomeSuccess)
 }
@@ -384,19 +398,52 @@ func (q *Queue) gcShard(ctx context.Context, shard uint16) markerCounts {
 				continue
 			}
 			switch env.State {
+			case statePublishing:
+				last := env.CreatedAt
+				if env.PublishingAt != nil {
+					last = *env.PublishingAt
+				}
+				if now.Sub(last) >= q.opts.PreparationTimeout {
+					if err := q.purgeExternalJob(ctx, shard, jobID, rec, env); err != nil {
+						q.opts.Logger.Warn(err, "queue: gc purge stale publishing failed", "job", jobID)
+					}
+					q.cleanMarkers(ctx, shard, jobID, env, &c)
+				} else {
+					q.resumePublishing(ctx, shard, jobID, env)
+				}
+			case statePurging:
+				// Resume purge: remove ref then tombstone.
+				if err := q.resumePurging(ctx, shard, jobID, rec, env); err != nil {
+					q.opts.Logger.Warn(err, "queue: gc resume purging failed", "job", jobID)
+				}
+				q.cleanMarkers(ctx, shard, jobID, env, &c)
 			case stateCompleted:
 				if env.CompletedAt != nil && now.Sub(*env.CompletedAt) >= q.opts.CompletedRetention {
-					if _, err := q.store.Delete(ctx, rec.Key, rec.Revision); err != nil {
-						q.opts.Logger.Warn(err, "queue: gc delete completed failed", "job", jobID)
-						continue
+					if env.PayloadRef != nil {
+						if err := q.purgeExternalJob(ctx, shard, jobID, rec, env); err != nil {
+							q.opts.Logger.Warn(err, "queue: gc purge external completed failed", "job", jobID)
+							continue
+						}
+					} else {
+						if _, err := q.store.Delete(ctx, rec.Key, rec.Revision); err != nil {
+							q.opts.Logger.Warn(err, "queue: gc delete completed failed", "job", jobID)
+							continue
+						}
 					}
 					q.cleanMarkers(ctx, shard, jobID, env, &c)
 				}
 			case stateDead:
-				if now.Sub(env.Dead.At) >= q.opts.DeadRetention {
-					if _, err := q.store.Delete(ctx, rec.Key, rec.Revision); err != nil {
-						q.opts.Logger.Warn(err, "queue: gc delete dead failed", "job", jobID)
-						continue
+				if env.Dead != nil && now.Sub(env.Dead.At) >= q.opts.DeadRetention {
+					if env.PayloadRef != nil {
+						if err := q.purgeExternalJob(ctx, shard, jobID, rec, env); err != nil {
+							q.opts.Logger.Warn(err, "queue: gc purge external dead failed", "job", jobID)
+							continue
+						}
+					} else {
+						if _, err := q.store.Delete(ctx, rec.Key, rec.Revision); err != nil {
+							q.opts.Logger.Warn(err, "queue: gc delete dead failed", "job", jobID)
+							continue
+						}
 					}
 					q.cleanMarkers(ctx, shard, jobID, env, &c)
 				}

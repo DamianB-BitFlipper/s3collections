@@ -17,7 +17,7 @@ func FuzzJobJSON(f *testing.F) {
 		if !utf8.ValidString(reason) {
 			t.Skip("reason is not valid UTF-8")
 		}
-		env := newJobEnvelope("job-1", "q", 7, payload, time.Now(), time.Now())
+		env := newInlineJobEnvelope("job-1", "q", 7, payload, time.Now(), time.Now())
 		env.Reasons = append(env.Reasons, reasonEnvelope{At: time.Now(), Reason: reason})
 		data, err := encodeJob(env)
 		if err != nil {
@@ -30,7 +30,7 @@ func FuzzJobJSON(f *testing.F) {
 		if env2.ID != env.ID || env2.Queue != env.Queue || env2.Shard != env.Shard {
 			t.Fatal("metadata mismatch")
 		}
-		got, err := jobPayload(env2)
+		got, err := jobInlinePayload(env2)
 		if err != nil {
 			t.Fatalf("payload decode: %v", err)
 		}

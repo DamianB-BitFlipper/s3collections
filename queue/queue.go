@@ -12,17 +12,24 @@ import (
 	"github.com/damianb/s3collections"
 	"github.com/damianb/s3collections/cas"
 	"github.com/damianb/s3collections/s3backend"
+	"github.com/damianb/s3collections/tree"
 )
 
 // Queue is a durable, S3-backed at-least-once work queue. Canonical job
 // state lives in a cas.Store; small marker objects guide LIST-based claim
 // and reaper scans. A Queue value is safe for concurrent use.
+//
+// External payloads larger than InlinePayloadBytes are stored in a private
+// tree.Store under a queue-isolated payload prefix. The canonical job
+// envelope holds only metadata (a small payload descriptor); the payload bytes are
+// never serialized into CAS.
 type Queue struct {
-	name   string
-	prefix string
-	opts   Options
-	store  *cas.Store
-	be     s3backend.Backend
+	name     string
+	prefix   string
+	opts     Options
+	store    *cas.Store
+	payloads *tree.Store
+	be       s3backend.Backend
 
 	maintenanceMu sync.Mutex
 	maintenanceOn atomic.Bool
@@ -45,11 +52,17 @@ func New(b s3backend.Backend, name string, opts ...Option) (*Queue, error) {
 		opt(&o)
 	}
 	applyDefaults(&o)
+	if o.InlinePayloadBytes > o.MaxPayloadBytes {
+		return nil, errors.New("queue: inline payload limit exceeds overall limit")
+	}
+	if o.InlinePayloadBytes > 480*1024 {
+		return nil, errors.New("queue: inline payload limit exceeds metadata capacity")
+	}
 
 	prefix := fmt.Sprintf("queue/%s/", name)
 	store, err := cas.New(b, prefix,
 		cas.WithWriterID(o.WorkerID),
-		cas.WithMaxValueBytes(o.MaxPayloadBytes*2+8192), // envelope overhead
+		cas.WithMaxValueBytes(casMetadataCeiling),
 		cas.WithRetry(o.Retry),
 		cas.WithMeter(o.Meter),
 		cas.WithLogger(o.Logger),
@@ -60,12 +73,31 @@ func New(b s3backend.Backend, name string, opts ...Option) (*Queue, error) {
 		return nil, fmt.Errorf("queue: create cas store: %w", err)
 	}
 
+	// Private tree.Store for external payloads, under an isolated prefix
+	// with blob range 0..MaxPayloadBytes.
+	payloadPrefix := prefix + "payloads/"
+	payloads, err := tree.New(b, "queue-payloads",
+		tree.WithPrefix(payloadPrefix),
+		tree.WithBlobSizeRange(0, int64(o.MaxPayloadBytes)),
+		tree.WithMultipartThreshold(int64(o.MaxPayloadBytes)/5),
+		tree.WithGCGrace(o.PayloadGCGrace),
+		tree.WithRetry(o.Retry),
+		tree.WithMeter(o.Meter),
+		tree.WithLogger(o.Logger),
+		tree.WithTracer(o.Tracer),
+		tree.WithClock(o.now),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("queue: create payload store: %w", err)
+	}
+
 	q := &Queue{
-		name:   name,
-		prefix: prefix,
-		opts:   o,
-		store:  store,
-		be:     b,
+		name:     name,
+		prefix:   prefix,
+		opts:     o,
+		store:    store,
+		payloads: payloads,
+		be:       b,
 	}
 	return q, nil
 }

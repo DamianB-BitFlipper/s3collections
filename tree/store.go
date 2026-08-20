@@ -153,14 +153,15 @@ type GCEdgeCandidate struct {
 	Object        GCObjectVersion
 }
 type GCPlan struct {
-	ID          string
-	CreatedAt   time.Time
-	NotBefore   time.Time
-	Cutoff      time.Time
-	PinnedRoots []NodeID
-	Nodes       []GCNodeCandidate
-	Blobs       []GCBlobCandidate
-	Edges       []GCEdgeCandidate
+	ID            string
+	CreatedAt     time.Time
+	NotBefore     time.Time
+	Cutoff        time.Time
+	ClockSkewHint time.Duration
+	PinnedRoots   []NodeID
+	Nodes         []GCNodeCandidate
+	Blobs         []GCBlobCandidate
+	Edges         []GCEdgeCandidate
 }
 type SweepResult struct{ NodesDeleted, BlobsDeleted, EdgesDeleted int }
 

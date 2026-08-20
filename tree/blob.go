@@ -83,38 +83,83 @@ func (s *Store) PutBlob(ctx context.Context, expectedHash BlobID, r io.Reader, o
 	if err != nil {
 		return BlobRef{}, err
 	}
-	// Publication and its recent pin share the same mutation gate as GC sweep.
-	// Hashing/spooling above remains outside the gate.
-	var out BlobRef
-	err = s.withMutationGate(ctx, "put_blob", func(g *mutationGate) error {
-		gerr := s.runBackend(ctx, "get_blob_manifest", func() error { _, e := s.backend.Get(ctx, s.blobMetaKey(expectedHash)); return e })
-		if gerr == nil {
-			stored, e := s.statBlobID(ctx, expectedHash)
-			if e != nil {
-				return e
+	// Upload raw immutable data OUTSIDE the mutation gate so that large
+	// (multi-hundred-MiB) uploads do not serialize against ref/lease/GC
+	// mutations or exceed the gate TTL. A failed or abandoned data upload
+	// is harmless: it is an unreferenced object eligible for GC.
+	//
+	// Check whether the manifest already exists first to avoid a needless
+	// re-upload for an already-published blob.
+	manifestExists := false
+	if gerr := s.runBackend(ctx, "get_blob_manifest", func() error {
+		_, e := s.backend.Get(ctx, s.blobMetaKey(expectedHash))
+		return e
+	}); gerr == nil {
+		manifestExists = true
+	} else if !errors.Is(gerr, s3backend.ErrNotFound) {
+		return BlobRef{}, gerr
+	}
+
+	if manifestExists {
+		stored, e := s.statBlobID(ctx, expectedHash)
+		if e != nil {
+			return BlobRef{}, e
+		}
+		if e = s.verifyBlobData(ctx, expectedHash, stored.Size); e != nil {
+			return BlobRef{}, e
+		}
+		// Re-publish the recent blob pin under the gate so a concurrent GC
+		// sweep cannot collect the blob between verification and pin.
+		if e = s.withMutationGate(ctx, "put_blob_pin", func(g *mutationGate) error {
+			meta, se := s.backend.Get(ctx, s.blobMetaKey(expectedHash))
+			if se != nil {
+				return se
 			}
-			if e = s.verifyBlobData(ctx, expectedHash, stored.Size); e != nil {
-				return e
+			var current blobManifest
+			if decodeCanonical(meta.Body, &current) != nil || current.V != 1 || current.Hash != expectedHash || current.Size != stored.Size {
+				return ErrCorrupt
 			}
-			out = stored
-			if e = s.renewMutationGate(ctx, g); e != nil {
+			stored = current.ref()
+			st, se := s.statObject(ctx, s.blobDataKey(expectedHash))
+			if se != nil {
+				return se
+			}
+			if st.Size != stored.Size {
+				return ErrCorrupt
+			}
+			if e := s.renewMutationGate(ctx, g); e != nil {
 				return e
 			}
 			return s.publishRecentBlobPin(ctx, expectedHash)
+		}); e != nil {
+			return BlobRef{}, e
 		}
-		if !errors.Is(gerr, s3backend.ErrNotFound) {
-			return gerr
-		}
+		return stored, nil
+	}
+
+	// Upload raw data outside the gate.
+	if e := s.uploadRawBlob(ctx, expectedHash, f, n); e != nil {
+		return BlobRef{}, e
+	}
+
+	// Acquire the gate only for the short publication phase: verify the
+	// raw object survived, publish the immutable manifest, and pin.
+	var out BlobRef
+	err = s.withMutationGate(ctx, "put_blob", func(g *mutationGate) error {
+		// A concurrent GC sweep may have removed the raw data object while
+		// we were acquiring the gate. If so, re-upload under the gate.
 		if e := s.renewMutationGate(ctx, g); e != nil {
 			return e
 		}
-		if e := s.uploadRawBlob(ctx, expectedHash, f, n); e != nil {
-			return e
+		st, statErr := s.statObject(ctx, s.blobDataKey(expectedHash))
+		if statErr != nil {
+			return statErr
 		}
-		if e := s.renewMutationGate(ctx, g); e != nil {
-			return e
+		if st.Size != n {
+			return ErrCorrupt
 		}
 		if e := s.putImmutable(ctx, "put_blob_manifest", s.blobMetaKey(expectedHash), manifest); e != nil {
+			// Manifest may already exist from a concurrent publisher.
 			stored, se := s.statBlobID(ctx, expectedHash)
 			if se != nil || s.verifyBlobData(ctx, expectedHash, stored.Size) != nil {
 				return e

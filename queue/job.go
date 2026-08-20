@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -9,10 +10,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/damianb/s3collections/tree"
 )
+
+// PayloadID is the content hash of a payload, identical to tree.BlobID.
+type PayloadID = tree.BlobID
+
+// PayloadInfo describes a job payload.
+type PayloadInfo struct {
+	// ID is the content hash (PayloadID) of the payload. For inline payloads
+	// it is the SHA-256 of the decoded payload bytes. For external payloads
+	// it is the tree.BlobID of the stored blob.
+	ID PayloadID `json:"id"`
+	// Size is the payload size in bytes.
+	Size int64 `json:"size"`
+}
 
 // Lease is a snapshot of a job lease.
 type Lease struct {
@@ -20,6 +37,9 @@ type Lease struct {
 	Owner string
 	// Expiry is the lease expiration time.
 	Expiry time.Time
+	// Token is a random per-claim token that prevents a stale Job handle
+	// (from the same WorkerID) from operating on a later re-claim.
+	Token string
 }
 
 // Job represents a claimed job returned by Claim.
@@ -30,8 +50,14 @@ type Job struct {
 	Queue string
 	// Shard is the shard index containing the job.
 	Shard uint16
-	// Payload is the user-supplied payload bytes.
+	// Payload is the user-supplied payload bytes. It is non-nil for inline
+	// jobs when DeferPayload is false. It is nil for external jobs or when
+	// DeferPayload is true; use OpenPayload to stream the payload.
 	Payload []byte
+	// PayloadInfo describes the payload (ID and size). Always populated.
+	PayloadInfo PayloadInfo
+	// PayloadSize is the payload size in bytes. Always populated.
+	PayloadSize int64
 	// Attempts is the number of successful claims so far, including this one.
 	Attempts int
 	// Fence is the cas revision of the canonical job at the moment of claim
@@ -45,8 +71,21 @@ type Job struct {
 	// CreatedAt is the time the job was first enqueued.
 	CreatedAt time.Time
 
-	q      *Queue
-	appKey string
+	// external is true when the payload is stored in the payload tree.
+	external      bool
+	inlinePayload []byte
+	q             *Queue
+	appKey        string
+}
+
+// OpenPayload returns a reader for the job payload. For inline jobs it
+// returns a bytes reader. For external jobs it streams and verifies the
+// payload from the payload tree. The caller must close the reader.
+func (j *Job) OpenPayload(ctx context.Context) (io.ReadCloser, error) {
+	if !j.external {
+		return io.NopCloser(bytes.NewReader(j.inlinePayload)), nil
+	}
+	return j.q.openExternalPayload(ctx, j.PayloadInfo.ID, j.PayloadInfo.Size)
 }
 
 // Renew extends the job's lease. extendBy must be positive.
@@ -96,16 +135,19 @@ func Guard(latest, provided uint64) error {
 type jobState string
 
 const (
-	statePending   jobState = "pending"
-	stateClaimed   jobState = "claimed"
-	stateCompleted jobState = "completed"
-	stateDead      jobState = "dead"
+	statePending    jobState = "pending"
+	stateClaimed    jobState = "claimed"
+	stateCompleted  jobState = "completed"
+	stateDead       jobState = "dead"
+	statePublishing jobState = "publishing"
+	statePurging    jobState = "purging"
 )
 
 // leaseEnvelope is the JSON form of a lease.
 type leaseEnvelope struct {
 	Owner  string    `json:"owner"`
 	Expiry time.Time `json:"expiry"`
+	Token  string    `json:"token"`
 }
 
 // reasonEnvelope records a retry/dead reason.
@@ -120,7 +162,23 @@ type deadEnvelope struct {
 	At     time.Time `json:"at"`
 }
 
+// payloadRefDescriptor is the external payload reference stored in the job
+// envelope. It is mutually exclusive with the legacy inline payload field.
+type payloadRefDescriptor struct {
+	// BlobRef is the tree blob reference for the payload.
+	BlobRef tree.BlobRef `json:"blobRef"`
+	// NodeID is the tree root node containing the payload blob.
+	NodeID tree.NodeID `json:"nodeId"`
+	// OwnerRefName is the deterministic tree ref name pointing at NodeID.
+	OwnerRefName string `json:"ownerRefName"`
+	// OwnerRefRevision is the revision of the tree ref at the time of
+	// publication.
+	OwnerRefRevision uint64 `json:"ownerRefRevision"`
+}
+
 // jobEnvelope is the canonical JSON representation of a job stored by cas.
+// It is metadata-only: payload bytes are either inline (base64 in LegacyPayload,
+// capped at InlinePayloadBytes) or external (in PayloadRef).
 type jobEnvelope struct {
 	ID    string `json:"id"`
 	Queue string `json:"queue"`
@@ -134,9 +192,21 @@ type jobEnvelope struct {
 	NotBefore   time.Time        `json:"notBefore"`
 	Lease       *leaseEnvelope   `json:"lease,omitempty"`
 	Reasons     []reasonEnvelope `json:"reasons,omitempty"`
-	Payload     string           `json:"payload"`
-	CompletedAt *time.Time       `json:"completedAt,omitempty"`
-	Dead        *deadEnvelope    `json:"dead,omitempty"`
+	PayloadInfo PayloadInfo      `json:"payloadInfo"`
+	// LegacyPayload holds inline payload bytes as base64. It is omitted when
+	// empty (external jobs). Old envelopes always emit it, possibly as "".
+	LegacyPayload string `json:"payload,omitempty"`
+	// PayloadRef is the external payload descriptor. Mutually exclusive with
+	// LegacyPayload: exactly one is non-empty when the job is in a finalized
+	// state (pending/claimed/completed/dead).
+	PayloadRef *payloadRefDescriptor `json:"payloadRef,omitempty"`
+	// PrepToken is a random token written into the publishing envelope so
+	// that ambiguous CAS-create results can be reconciled.
+	PrepToken    string        `json:"prepToken,omitempty"`
+	PublishingAt *time.Time    `json:"publishingAt,omitempty"`
+	CompletedAt  *time.Time    `json:"completedAt,omitempty"`
+	Dead         *deadEnvelope `json:"dead,omitempty"`
+	PurgedAt     *time.Time    `json:"purgedAt,omitempty"`
 }
 
 // encodeJob serializes env to JSON bytes.
@@ -144,39 +214,101 @@ func encodeJob(env *jobEnvelope) ([]byte, error) {
 	return json.Marshal(env)
 }
 
-// decodeJob parses a job envelope. It validates the payload base64.
+// decodeJob parses a job envelope. It validates that exactly one payload
+// representation exists for finalized states.
 func decodeJob(data []byte) (*jobEnvelope, error) {
 	var env jobEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, err
 	}
-	if env.Payload != "" {
-		if _, err := base64.StdEncoding.DecodeString(env.Payload); err != nil {
-			return nil, fmt.Errorf("queue: invalid payload base64: %w", err)
+	// Validate payload representation for finalized states.
+	switch env.State {
+	case statePending, stateClaimed, stateCompleted, stateDead:
+		hasInline := env.LegacyPayload != ""
+		hasExternal := env.PayloadRef != nil
+		if hasInline && hasExternal {
+			return nil, fmt.Errorf("queue: job has both inline and external payload")
 		}
+		if hasInline {
+			if _, err := base64.StdEncoding.DecodeString(env.LegacyPayload); err != nil {
+				return nil, fmt.Errorf("queue: invalid inline payload base64: %w", err)
+			}
+		}
+		if hasExternal && (env.PayloadInfo.ID != env.PayloadRef.BlobRef.Hash || env.PayloadInfo.Size != env.PayloadRef.BlobRef.Size || env.PayloadInfo.Size < 0) {
+			return nil, fmt.Errorf("queue: external payload metadata mismatch")
+		}
+		// An empty payload (both representations absent) is valid; it
+		// decodes as a zero-length inline payload. This preserves backward
+		// compatibility with old envelopes that had empty payloads.
+	case statePublishing, statePurging:
+		// Publishing/purging may not have a finalized payload yet (publishing)
+		// or may retain the descriptor (purging for cleanup).
+	default:
+		return nil, fmt.Errorf("queue: unknown job state %q", env.State)
 	}
 	return &env, nil
 }
 
-// jobPayload returns the decoded payload from an envelope.
-func jobPayload(env *jobEnvelope) ([]byte, error) {
-	if env.Payload == "" {
+// jobInlinePayload returns the decoded inline payload from an envelope.
+func jobInlinePayload(env *jobEnvelope) ([]byte, error) {
+	if env.LegacyPayload == "" {
 		return nil, nil
 	}
-	return base64.StdEncoding.DecodeString(env.Payload)
+	return base64.StdEncoding.DecodeString(env.LegacyPayload)
 }
 
-// newJobEnvelope builds a pending job envelope.
-func newJobEnvelope(id, queue string, shard uint16, payload []byte, createdAt, notBefore time.Time) *jobEnvelope {
+// isExternalJob reports whether the envelope stores its payload externally.
+func isExternalJob(env *jobEnvelope) bool {
+	return env.PayloadRef != nil
+}
+
+// newInlineJobEnvelope builds a pending job envelope with inline payload.
+func newInlineJobEnvelope(id, queue string, shard uint16, payload []byte, createdAt, notBefore time.Time) *jobEnvelope {
+	sum := sha256.Sum256(payload)
 	return &jobEnvelope{
-		ID:        id,
-		Queue:     queue,
-		Shard:     shard,
-		State:     statePending,
-		Attempts:  0,
-		CreatedAt: createdAt,
-		NotBefore: notBefore,
-		Payload:   base64.StdEncoding.EncodeToString(payload),
+		ID:            id,
+		Queue:         queue,
+		Shard:         shard,
+		State:         statePending,
+		Attempts:      0,
+		CreatedAt:     createdAt,
+		NotBefore:     notBefore,
+		PayloadInfo:   PayloadInfo{ID: hex.EncodeToString(sum[:]), Size: int64(len(payload))},
+		LegacyPayload: base64.StdEncoding.EncodeToString(payload),
+	}
+}
+
+// newPublishingJobEnvelope builds a publishing-state envelope with metadata
+// but no payload bytes. payloadInfo carries the payload ID and size so that
+// maintenance can resume publication after a crash.
+func newPublishingJobEnvelope(id, queue string, shard uint16, prepToken string, payloadInfo PayloadInfo, createdAt, notBefore time.Time) *jobEnvelope {
+	return &jobEnvelope{
+		ID:           id,
+		Queue:        queue,
+		Shard:        shard,
+		State:        statePublishing,
+		Attempts:     0,
+		CreatedAt:    createdAt,
+		NotBefore:    notBefore,
+		PrepToken:    prepToken,
+		PublishingAt: &createdAt,
+		PayloadInfo:  payloadInfo,
+	}
+}
+
+// newExternalJobEnvelope builds a pending job envelope with an external
+// payload descriptor.
+func newExternalJobEnvelope(id, queue string, shard uint16, ref *payloadRefDescriptor, payloadInfo PayloadInfo, createdAt, notBefore time.Time) *jobEnvelope {
+	return &jobEnvelope{
+		ID:          id,
+		Queue:       queue,
+		Shard:       shard,
+		State:       statePending,
+		Attempts:    0,
+		CreatedAt:   createdAt,
+		NotBefore:   notBefore,
+		PayloadInfo: payloadInfo,
+		PayloadRef:  ref,
 	}
 }
 
@@ -192,6 +324,15 @@ func randomSuffix() string {
 	if _, err := rand.Read(b); err != nil {
 		// crypto/rand reads from the operating-system entropy source and
 		// essentially never returns an error in practice.
+		panic(fmt.Sprintf("queue: crypto/rand failed: %v", err))
+	}
+	return hex.EncodeToString(b)
+}
+
+// randomToken returns 32 hex digits from crypto/rand for lease tokens.
+func randomToken() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
 		panic(fmt.Sprintf("queue: crypto/rand failed: %v", err))
 	}
 	return hex.EncodeToString(b)
@@ -226,6 +367,12 @@ func ts20(t time.Time) string {
 // jobAppKey returns the cas application key for a canonical job object.
 func jobAppKey(shard uint16, jobID string) string {
 	return fmt.Sprintf("shard/%s/jobs/%s", shardHex(shard), jobID)
+}
+
+// ownerRefName returns the deterministic tree ref name for a job's payload
+// ownership ref.
+func ownerRefName(shard uint16, jobID, token string) string {
+	return fmt.Sprintf("job/%s/%s/%s", shardHex(shard), jobID, token)
 }
 
 // readyMarkerKey returns the raw backend object key for a ready marker.
@@ -269,4 +416,16 @@ func (q *Queue) parseMarker(key string) (shard uint16, kind string, ts time.Time
 		return
 	}
 	return uint16(shard64), kind, time.UnixMicro(usec).UTC(), parts[3], true
+}
+
+// newJobEnvelope is a backward-compatible alias for newInlineJobEnvelope.
+// Existing tests and callers that construct inline envelopes use this name.
+func newJobEnvelope(id, queue string, shard uint16, payload []byte, createdAt, notBefore time.Time) *jobEnvelope {
+	return newInlineJobEnvelope(id, queue, shard, payload, createdAt, notBefore)
+}
+
+// jobPayload is a backward-compatible alias for jobInlinePayload.
+// Existing tests and callers that decode inline payloads use this name.
+func jobPayload(env *jobEnvelope) ([]byte, error) {
+	return jobInlinePayload(env)
 }

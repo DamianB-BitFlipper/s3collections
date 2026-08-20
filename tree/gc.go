@@ -49,7 +49,7 @@ func (s *Store) PlanGCWithOptions(ctx context.Context, o GCPlanOptions) (GCPlan,
 	}
 	// Nodes newer than the cutoff are temporary roots: although not candidates
 	// themselves, their older ancestors and payloads must remain reachable.
-	fresh, err := s.freshNodeRoots(ctx, o.Cutoff)
+	fresh, err := s.freshNodeRoots(ctx, o.Cutoff, s.opts.ClockSkewHint)
 	if err != nil {
 		return GCPlan{}, err
 	}
@@ -89,7 +89,7 @@ func (s *Store) PlanGCWithOptions(ctx context.Context, o GCPlanOptions) (GCPlan,
 	if err != nil {
 		return GCPlan{}, err
 	}
-	plan := GCPlan{ID: id, CreatedAt: now, NotBefore: now.Add(grace), Cutoff: o.Cutoff, PinnedRoots: pins, Nodes: nodes, Blobs: blobs, Edges: edges}
+	plan := GCPlan{ID: id, CreatedAt: now, NotBefore: now.Add(grace), Cutoff: o.Cutoff, ClockSkewHint: s.opts.ClockSkewHint, PinnedRoots: pins, Nodes: nodes, Blobs: blobs, Edges: edges}
 	body, err := json.Marshal(plan)
 	if err != nil {
 		return GCPlan{}, err
@@ -105,7 +105,7 @@ func (s *Store) PlanGCWithOptions(ctx context.Context, o GCPlanOptions) (GCPlan,
 // and object-version validation no liveness publication can race an
 // unconditional S3 Delete. The gate is renewed before every candidate.
 func (s *Store) SweepGC(ctx context.Context, plan GCPlan) (out SweepResult, err error) {
-	if !validLeaseID(plan.ID) || plan.Cutoff.IsZero() || plan.CreatedAt.IsZero() || plan.Cutoff.After(plan.CreatedAt) || plan.NotBefore.Before(plan.CreatedAt.Add(s.opts.GCGrace)) {
+	if !validLeaseID(plan.ID) || plan.Cutoff.IsZero() || plan.CreatedAt.IsZero() || plan.Cutoff.After(plan.CreatedAt) || plan.NotBefore.Before(plan.CreatedAt) {
 		return out, ErrInvalidGCPlan
 	}
 	var storedPlan *s3backend.Object
@@ -153,7 +153,7 @@ func (s *Store) SweepGC(ctx context.Context, plan GCPlan) (out SweepResult, err 
 		return out, e
 	}
 	pins = append(pins, recent...)
-	young, e := s.freshNodeRoots(ctx, plan.Cutoff)
+	young, e := s.freshNodeRoots(ctx, plan.Cutoff, plan.ClockSkewHint)
 	if e != nil {
 		return out, e
 	}
@@ -195,7 +195,7 @@ func (s *Store) SweepGC(ctx context.Context, plan GCPlan) (out SweepResult, err 
 		if _, ok := liveNodes[c.ID]; ok {
 			continue
 		}
-		same, e := s.versionUnchanged(ctx, c.Object, plan.Cutoff)
+		same, e := s.versionUnchanged(ctx, c.Object, plan.Cutoff, plan.ClockSkewHint)
 		if e != nil {
 			return out, e
 		}
@@ -214,7 +214,7 @@ func (s *Store) SweepGC(ctx context.Context, plan GCPlan) (out SweepResult, err 
 		if _, ok := liveBlobs[c.ID]; ok {
 			continue
 		}
-		exact, e := s.blobCandidateUnchanged(ctx, c, plan.Cutoff)
+		exact, e := s.blobCandidateUnchanged(ctx, c, plan.Cutoff, plan.ClockSkewHint)
 		if e != nil {
 			return out, e
 		}
@@ -249,7 +249,7 @@ func (s *Store) SweepGC(ctx context.Context, plan GCPlan) (out SweepResult, err 
 		if _, ok := ln[c.Child]; ok {
 			continue
 		}
-		same, e := s.versionUnchanged(ctx, c.Object, plan.Cutoff)
+		same, e := s.versionUnchanged(ctx, c.Object, plan.Cutoff, plan.ClockSkewHint)
 		if e != nil {
 			return out, e
 		}
@@ -335,11 +335,11 @@ func oldEnough(info s3backend.ObjectInfo, cutoff time.Time, skew time.Duration) 
 func versionOf(i s3backend.ObjectInfo) GCObjectVersion {
 	return GCObjectVersion{Key: i.Key, ETag: i.ETag, Size: i.Size, ModTime: i.ModTime}
 }
-func (s *Store) freshNodeRoots(ctx context.Context, cutoff time.Time) ([]NodeID, error) {
+func (s *Store) freshNodeRoots(ctx context.Context, cutoff time.Time, skew time.Duration) ([]NodeID, error) {
 	prefix := s.prefix + "n/"
 	var out []NodeID
 	err := s.eachObject(ctx, prefix, func(i s3backend.ObjectInfo) error {
-		if i.ModTime.IsZero() || i.ModTime.Add(s.opts.ClockSkewHint).After(cutoff) {
+		if i.ModTime.IsZero() || i.ModTime.Add(skew).After(cutoff) {
 			if id, ok := s.nodeIDFromKey(i.Key); ok {
 				out = append(out, id)
 			}
@@ -490,7 +490,7 @@ func (s *Store) edgeIDsFromKey(key string) (NodeID, NodeID, bool) {
 	return p, c, validateNodeID(p) == nil && validateNodeID(c) == nil
 }
 func (s *Store) validatePlanKeys(plan GCPlan) error {
-	eligible := func(v GCObjectVersion) bool { return oldVersionEnough(v, plan.Cutoff, s.opts.ClockSkewHint) }
+	eligible := func(v GCObjectVersion) bool { return oldVersionEnough(v, plan.Cutoff, plan.ClockSkewHint) }
 	for _, c := range plan.Nodes {
 		if validateNodeID(c.ID) != nil || c.Object.Key != s.nodeKey(c.ID) || !eligible(c.Object) {
 			return ErrInvalidGCPlan
@@ -517,7 +517,7 @@ func (s *Store) validatePlanKeys(plan GCPlan) error {
 	}
 	return nil
 }
-func (s *Store) blobCandidateUnchanged(ctx context.Context, c GCBlobCandidate, cutoff time.Time) (bool, error) {
+func (s *Store) blobCandidateUnchanged(ctx context.Context, c GCBlobCandidate, cutoff time.Time, skew time.Duration) (bool, error) {
 	checks := []struct {
 		want *GCObjectVersion
 		key  string
@@ -536,7 +536,7 @@ func (s *Store) blobCandidateUnchanged(ctx context.Context, c GCBlobCandidate, c
 		if x.want == nil {
 			return false, nil
 		}
-		if got.ModTime.IsZero() || got.ModTime.Add(s.opts.ClockSkewHint).After(cutoff) {
+		if got.ModTime.IsZero() || got.ModTime.Add(skew).After(cutoff) {
 			return false, nil
 		}
 		same := got.Size == x.want.Size
@@ -551,7 +551,7 @@ func (s *Store) blobCandidateUnchanged(ctx context.Context, c GCBlobCandidate, c
 	}
 	return true, nil
 }
-func (s *Store) versionUnchanged(ctx context.Context, want GCObjectVersion, cutoff time.Time) (bool, error) {
+func (s *Store) versionUnchanged(ctx context.Context, want GCObjectVersion, cutoff time.Time, skew time.Duration) (bool, error) {
 	got, err := s.statObject(ctx, want.Key)
 	if errors.Is(err, s3backend.ErrNotFound) {
 		return false, nil
@@ -559,7 +559,7 @@ func (s *Store) versionUnchanged(ctx context.Context, want GCObjectVersion, cuto
 	if err != nil {
 		return false, err
 	}
-	if got.ModTime.IsZero() || got.ModTime.Add(s.opts.ClockSkewHint).After(cutoff) {
+	if got.ModTime.IsZero() || got.ModTime.Add(skew).After(cutoff) {
 		return false, nil
 	}
 	same := got.Size == want.Size
@@ -572,4 +572,60 @@ func (s *Store) versionUnchanged(ctx context.Context, want GCObjectVersion, cuto
 }
 func (s *Store) deleteKey(ctx context.Context, key string) error {
 	return s.runBackend(ctx, "sweep_gc", func() error { return s.backend.Delete(ctx, key) })
+}
+
+// GetGCPlan reloads a persisted GC plan by ID. It validates the stored object
+// matches the expected plan structure. Returns ErrNotFound if no plan exists.
+func (s *Store) GetGCPlan(ctx context.Context, planID string) (GCPlan, error) {
+	if !validLeaseID(planID) {
+		return GCPlan{}, ErrInvalidGCPlan
+	}
+	var obj *s3backend.Object
+	err := s.runBackend(ctx, "get_gc_plan", func() error {
+		var e error
+		obj, e = s.backend.Get(ctx, s.gcPlanKey(planID))
+		return e
+	})
+	if errors.Is(err, s3backend.ErrNotFound) {
+		return GCPlan{}, ErrNotFound
+	}
+	if err != nil {
+		return GCPlan{}, err
+	}
+	var plan GCPlan
+	if err = json.Unmarshal(obj.Body, &plan); err != nil {
+		return GCPlan{}, &CorruptError{Key: s.gcPlanKey(planID), Reason: err.Error()}
+	}
+	if plan.ID != planID {
+		return GCPlan{}, &CorruptError{Key: s.gcPlanKey(planID), Reason: "plan ID mismatch"}
+	}
+	return plan, nil
+}
+
+// ListGCPlans returns all persisted GC plans in the store. Plans that fail
+// to decode are skipped. This allows queue maintenance to discover and sweep
+// due plans without separate marker objects.
+func (s *Store) ListGCPlans(ctx context.Context) ([]GCPlan, error) {
+	prefix := s.prefix + "gc/plans/"
+	var out []GCPlan
+	err := s.eachObject(ctx, prefix, func(info s3backend.ObjectInfo) error {
+		base := strings.TrimSuffix(strings.TrimPrefix(info.Key, prefix), ".json")
+		if !validLeaseID(base) {
+			return nil
+		}
+		obj, e := s.backend.Get(ctx, info.Key)
+		if errors.Is(e, s3backend.ErrNotFound) {
+			return nil
+		}
+		if e != nil {
+			return e
+		}
+		var plan GCPlan
+		if json.Unmarshal(obj.Body, &plan) != nil || plan.ID != base {
+			return nil // skip corrupt
+		}
+		out = append(out, plan)
+		return nil
+	})
+	return out, err
 }
