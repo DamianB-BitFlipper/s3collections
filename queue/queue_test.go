@@ -40,6 +40,7 @@ func testQueue(t *testing.T, name string, opts ...Option) (*Queue, *s3backend.Me
 	t.Helper()
 	mem := s3backend.NewMemory()
 	clk := newFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	mem.SetClock(clk.Now)
 	base := []Option{func(o *Options) {
 		o.now = clk.Now
 		o.ReaperInterval = 100 * time.Millisecond
@@ -85,7 +86,7 @@ func TestEnqueueCreatesJobAndMarker(t *testing.T) {
 	if env.State != statePending {
 		t.Fatalf("state = %s, want pending", env.State)
 	}
-	gotPayload, _ := jobPayload(env)
+	gotPayload, _ := jobInlinePayload(env)
 	if string(gotPayload) != string(payload) {
 		t.Fatalf("payload mismatch: %q vs %q", gotPayload, payload)
 	}
@@ -745,7 +746,7 @@ func TestReaperBackfillsDeadMarker(t *testing.T) {
 	now := clk.Now()
 	jobID := "dead-job-1"
 	shard := uint16(0)
-	env := newJobEnvelope(jobID, q.name, shard, []byte("payload"), now, now)
+	env := newInlineJobEnvelope(jobID, q.name, shard, []byte("payload"), now, now)
 	env.State = stateDead
 	env.Dead = &deadEnvelope{Reason: "crash", At: now}
 	body, err := encodeJob(env)
@@ -790,7 +791,7 @@ func TestListDeadDenseShardPagination(t *testing.T) {
 	for i := 0; i < total; i++ {
 		jobID := fmt.Sprintf("dead-%04d", i)
 		when := base.Add(time.Duration(i) * time.Microsecond)
-		env := newJobEnvelope(jobID, q.name, shard, []byte("p"), base, base)
+		env := newInlineJobEnvelope(jobID, q.name, shard, []byte("p"), base, base)
 		env.State = stateDead
 		env.Dead = &deadEnvelope{Reason: "boom", At: when}
 		body, err := encodeJob(env)

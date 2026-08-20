@@ -42,7 +42,7 @@ func WithRetry(p s3collections.RetryPolicy) Option { return func(o *Options) { o
 func WithMeter(m s3collections.Meter) Option       { return func(o *Options) { o.Meter = m } }
 func WithLogger(l s3collections.Logger) Option     { return func(o *Options) { o.Logger = l } }
 func WithTracer(t s3collections.Tracer) Option     { return func(o *Options) { o.Tracer = t } }
-func withClock(now func() time.Time) Option        { return func(o *Options) { o.Now = now } }
+func WithClock(now func() time.Time) Option        { return func(o *Options) { o.Now = now } }
 
 func defaultOptions() Options {
 	return Options{

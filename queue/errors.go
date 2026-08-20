@@ -19,4 +19,16 @@ var (
 	// ErrFenceStale is returned by Guard when the provided fence token is
 	// older than the latest known fence.
 	ErrFenceStale = errors.New("stale fence")
+
+	// ErrPayloadTooLarge is returned by Enqueue or EnqueueReader when the
+	// payload exceeds MaxPayloadBytes.
+	ErrPayloadTooLarge = errors.New("queue: payload exceeds maximum size")
+
+	// ErrBackendCapability is returned when the backend does not support a
+	// required streaming capability (e.g. multipart or stream PUT).
+	ErrBackendCapability = errors.New("queue: backend capability unavailable")
+
+	// ErrPayloadNotFound is returned by OpenPayload when the external payload
+	// can no longer be found (e.g. after GC).
+	ErrPayloadNotFound = errors.New("queue: payload not found")
 )

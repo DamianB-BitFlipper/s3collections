@@ -242,6 +242,26 @@ Run `StartMaintenance` on every replica. Long-running jobs should call
 `job.Renew` before their visibility timeout expires. Delivery is at least
 once, so handlers must tolerate duplicate execution.
 
+Large payloads use the same queue abstraction without placing their bytes in
+the mutable job envelope:
+
+```go
+jobID, existed, err := q.EnqueueReader(ctx, input, size, queue.EnqueueOptions{
+	IdempotencyKey: key,
+})
+
+job, err := q.Claim(ctx, queue.ClaimOptions{DeferPayload: true})
+payload, err := job.OpenPayload(ctx)
+if err != nil { /* handle */ }
+defer payload.Close()
+```
+
+Payload bytes above `InlinePayloadBytes` are stored as immutable,
+content-addressed objects. Claims, renewals, retries, completion, and
+dead-letter transitions update only small metadata. Queue maintenance owns
+payload retention and reachability cleanup; callers do not manage blob refs or
+GC roots.
+
 ## Tradeoffs
 
 This library is a reasonable fit when the state is modest, S3 is already part
@@ -252,7 +272,7 @@ the wrong fit when you need:
 - a frequently written single key;
 - transactions or invariants across several keys;
 - strict global queue order at high throughput;
-- large queue payloads (the default limit is 256 KiB).
+- sub-object payload mutation (large payloads are immutable and streamed).
 
 `List` calls drive much of the cost. Queue claims and maintenance, LRU scans,
 and garbage collection all list prefixes, so shard counts and scan intervals

@@ -360,12 +360,32 @@ jobID, existed, err := q.Enqueue(ctx, payload, queue.EnqueueOptions{
 job, err := q.Claim(ctx, queue.ClaimOptions{
 	VisibilityTimeout: 30 * time.Second,
 	RestrictToShards:  nil,
+	DeferPayload:      true, // stream large/external payloads
 })
 ```
 
 An idempotency key produces a deterministic job ID. Repeating the enqueue
 returns `existed=true` while the canonical job object, including its retained
 tombstone, still exists.
+
+For a stream or large payload:
+
+```go
+jobID, existed, err := q.EnqueueReader(ctx, reader, exactSize, opts)
+job, err := q.Claim(ctx, queue.ClaimOptions{DeferPayload: true})
+body, err := job.OpenPayload(ctx)
+defer body.Close()
+```
+
+Payloads larger than `InlinePayloadBytes` are stored in the queue's private
+immutable payload store. Mutable queue state contains only a content-addressed
+descriptor, so claims and state transitions never rewrite the large bytes.
+`Job.Payload` remains populated for inline jobs by default and is nil for
+external jobs. `PayloadSize` and `PayloadInfo` are always available.
+Ownership refs remain as small tombstones after payload release so delayed
+publishers cannot re-pin collected data. Deploy the new queue version to all
+workers before enqueueing external payloads; older workers do not understand
+the external descriptor.
 
 `Claim` returns `queue.ErrEmpty` when it finds no visible job in the shards it
 probes. A claim creates a lease. Other workers cannot claim that job until it
@@ -378,7 +398,9 @@ type Job struct {
 	ID        string
 	Queue     string
 	Shard     uint16
-	Payload   []byte
+	Payload     []byte
+	PayloadInfo queue.PayloadInfo
+	PayloadSize int64
 	Attempts  int
 	Fence     uint64
 	Lease     queue.Lease
@@ -416,8 +438,8 @@ err = q.RequeueDead(ctx, jobID, shard)
 ```
 
 Run `StartMaintenance` on every replica. It reclaims expired leases, repairs
-missing marker objects, records approximate queue depth, and garbage-collects
-old completed and dead jobs. Repeated calls on the same queue are harmless.
+missing marker and payload-publication state, records approximate queue depth,
+and garbage-collects retained job payloads after completed/dead retention. Repeated calls on the same queue are harmless.
 
 `ListDead` orders items by dead-letter time. Pass its opaque cursor back as
 `StartAfter`; pagination is finished when it returns an empty page and an
@@ -441,12 +463,16 @@ empty cursor.
 | `WithMaxAttempts` | Unlimited | Delivery limit before `Retry` dead-letters a job. |
 | `WithReasonHistory` | 8 | Retry/dead reasons retained per job. |
 | `WithSequencerEnabled` | `false` | Use one CAS sequencer and one shard for strict global order. |
-| `WithMaxPayloadBytes` | 256 KiB | Maximum enqueue payload. |
+| `WithMaxPayloadBytes` | 500 MiB | Maximum logical payload size. |
+| `WithInlinePayloadBytes` | 256 KiB | Largest payload stored in mutable CAS metadata. |
+| `WithPreparationTimeout` | 10 minutes | Recovery window for incomplete external publication. |
+| `WithPayloadGCGrace` | 1 minute | Minimum grace before unreachable payload collection. |
 | `WithRetry` | Shared retry default | Retry policy. |
 | `WithMeter`, `WithLogger`, `WithTracer` | No-op | Observability adapters. |
 
-`ErrEmpty`, `ErrStaleLease`, `ErrNotLeased`, and `ErrFenceStale` are matched
-with `errors.Is`.
+`ErrEmpty`, `ErrStaleLease`, `ErrNotLeased`, `ErrFenceStale`,
+`ErrPayloadTooLarge`, `ErrBackendCapability`, and `ErrPayloadNotFound` are
+matched with `errors.Is`.
 
 ## Retries and observability
 

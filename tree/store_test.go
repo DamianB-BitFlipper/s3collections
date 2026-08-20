@@ -19,7 +19,7 @@ import (
 
 func newTestStore(t *testing.T, b s3backend.Backend, now *time.Time, extra ...Option) *Store {
 	t.Helper()
-	opts := []Option{WithBlobSizeRange(1, 500<<20), WithMultipartThreshold(100 << 20), WithGCGrace(time.Hour), WithClockSkewHint(0), WithMutationGateTTL(time.Hour), WithRetry(s3collections.RetryPolicy{MaxAttempts: 3, Base: time.Microsecond, Max: time.Millisecond, Jitter: -1}), withClock(func() time.Time { return *now })}
+	opts := []Option{WithBlobSizeRange(1, 500<<20), WithMultipartThreshold(100 << 20), WithGCGrace(time.Hour), WithClockSkewHint(0), WithMutationGateTTL(time.Hour), WithRetry(s3collections.RetryPolicy{MaxAttempts: 3, Base: time.Microsecond, Max: time.Millisecond, Jitter: -1}), WithClock(func() time.Time { return *now })}
 	opts = append(opts, extra...)
 	s, err := New(b, "test/tree", opts...)
 	if err != nil {
@@ -1063,5 +1063,59 @@ func TestMutationGateReacquireReconcilesAppliedCancellation(t *testing.T) {
 	info, err := s.MutationGate(context.Background())
 	if err != nil || info.Held {
 		t.Fatalf("gate=%#v err=%v", info, err)
+	}
+}
+
+func TestListAndGetGCPlans(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1000, 0).UTC()
+	m := s3backend.NewMemory()
+	m.SetClock(func() time.Time { return now })
+	s := newTestStore(t, m, &now)
+	plan, err := s.PlanGC(ctx, now.Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetGCPlan(ctx, plan.ID)
+	if err != nil || got.ID != plan.ID {
+		t.Fatalf("get=%#v %v", got, err)
+	}
+	plans, err := s.ListGCPlans(ctx)
+	if err != nil || len(plans) != 1 || plans[0].ID != plan.ID {
+		t.Fatalf("plans=%#v %v", plans, err)
+	}
+}
+
+func TestSweepPersistedPlanSurvivesGraceIncrease(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1000, 0).UTC()
+	m := s3backend.NewMemory()
+	m.SetClock(func() time.Time { return now })
+	s1, err := New(m, "grace-change", WithBlobSizeRange(1, 1024), WithGCGrace(time.Minute), WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s1.CommitRoot(ctx, nil, []byte("candidate")); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Hour)
+	plan, err := s1.PlanGC(ctx, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Nodes) == 0 {
+		t.Fatal("expected candidate-bearing plan")
+	}
+	s2, err := New(m, "grace-change", WithBlobSizeRange(1, 1024), WithGCGrace(time.Hour), WithClockSkewHint(90*time.Minute), WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Hour)
+	result, err := s2.SweepGC(ctx, plan)
+	if err != nil {
+		t.Fatalf("persisted plan rejected after config change: %v", err)
+	}
+	if result.NodesDeleted == 0 {
+		t.Fatalf("candidate not swept: %#v", result)
 	}
 }

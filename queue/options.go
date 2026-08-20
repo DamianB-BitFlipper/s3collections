@@ -86,28 +86,54 @@ type Options struct {
 	// Tracer receives traces. A nil value is replaced by a no-op tracer.
 	Tracer s3collections.Tracer
 
-	// MaxPayloadBytes caps the payload size accepted by Enqueue. Defaults to
-	// 256 KiB.
+	// MaxPayloadBytes caps the overall payload size accepted by Enqueue and
+	// EnqueueReader. It also becomes the tree.Store MaxBlobBytes for
+	// external payloads. Defaults to 500 MiB.
 	MaxPayloadBytes int
+
+	// InlinePayloadBytes is the threshold at or below which payloads are stored
+	// inline in the CAS envelope (legacy path). Payloads larger than this
+	// are offloaded to the tree.Store. Defaults to 256 KiB.
+	InlinePayloadBytes int
+
+	// PreparationTimeout is the maximum duration an external payload job may
+	// remain in the publishing state before maintenance reconciles or purges
+	// it. Defaults to 10m.
+	PreparationTimeout time.Duration
+
+	// PayloadGCGrace is the minimum reachability-GC grace after terminal
+	// retention releases an external payload. Defaults to 1m.
+	PayloadGCGrace time.Duration
 
 	// now, when non-nil, overrides the wall clock. It is used by tests.
 	now func() time.Time
 }
 
 const (
-	defaultShards                    = 256
-	defaultVisibilityTimeout         = 30 * time.Second
-	defaultClockSkewTolerance        = 2 * time.Second
-	defaultClaimPageSize             = 128
-	defaultClaimMaxPages             = 4
-	defaultReaperInterval            = 5 * time.Second
-	defaultGCInterval                = 5 * time.Minute
-	defaultCompletedRetention        = 24 * time.Hour
-	defaultDeadRetention             = 168 * time.Hour
-	defaultReasonHistory             = 8
-	defaultMaxPayloadBytes           = 256 * 1024
+	defaultShards             = 256
+	defaultVisibilityTimeout  = 30 * time.Second
+	defaultClockSkewTolerance = 2 * time.Second
+	defaultClaimPageSize      = 128
+	defaultClaimMaxPages      = 4
+	defaultReaperInterval     = 5 * time.Second
+	defaultGCInterval         = 5 * time.Minute
+	defaultCompletedRetention = 24 * time.Hour
+	defaultDeadRetention      = 168 * time.Hour
+	defaultReasonHistory      = 8
+	// defaultMaxPayloadBytes is the overall payload ceiling (500 MiB).
+	defaultMaxPayloadBytes = 500 * 1024 * 1024
+	// defaultInlinePayloadBytes is the inline/external threshold (256 KiB).
+	defaultInlinePayloadBytes = 256 * 1024
+	// defaultPreparationTimeout bounds how long a publishing job may linger.
+	defaultPreparationTimeout = 10 * time.Minute
+	// defaultPayloadGCGrace is the grace period after terminal retention
+	// before external payload cleanup.
+	defaultPayloadGCGrace            = 1 * time.Minute
 	defaultTombstoneRetention        = 5 * time.Minute
 	maxShards                 uint16 = 65535
+	// casMetadataCeiling is the fixed CAS MaxValueBytes for job envelopes.
+	// It is a metadata ceiling, never derived from MaxPayloadBytes.
+	casMetadataCeiling = 1 << 20 // 1 MiB
 )
 
 // applyDefaults fills zero fields in o with package defaults.
@@ -157,6 +183,15 @@ func applyDefaults(o *Options) {
 	}
 	if o.MaxPayloadBytes <= 0 {
 		o.MaxPayloadBytes = defaultMaxPayloadBytes
+	}
+	if o.InlinePayloadBytes <= 0 {
+		o.InlinePayloadBytes = defaultInlinePayloadBytes
+	}
+	if o.PreparationTimeout <= 0 {
+		o.PreparationTimeout = defaultPreparationTimeout
+	}
+	if o.PayloadGCGrace <= 0 {
+		o.PayloadGCGrace = defaultPayloadGCGrace
 	}
 	o.Retry = o.Retry.WithDefaults()
 	o.Meter = s3collections.MeterOrNoop(o.Meter)
@@ -265,9 +300,30 @@ func WithTracer(t s3collections.Tracer) Option {
 	return func(o *Options) { o.Tracer = t }
 }
 
-// WithMaxPayloadBytes caps the payload size accepted by Enqueue.
+// WithMaxPayloadBytes caps the overall payload size accepted by Enqueue and
+// EnqueueReader. It also bounds the tree.Store blob size for external
+// payloads.
 func WithMaxPayloadBytes(n int) Option {
 	return func(o *Options) { o.MaxPayloadBytes = n }
+}
+
+// WithInlinePayloadBytes sets the threshold at or below which payloads are stored
+// inline in the CAS envelope. Payloads larger than this are offloaded to the
+// tree.Store.
+func WithInlinePayloadBytes(n int) Option {
+	return func(o *Options) { o.InlinePayloadBytes = n }
+}
+
+// WithPreparationTimeout sets the maximum duration an external payload job
+// may remain in the publishing state before maintenance reconciles or purges
+// it.
+func WithPreparationTimeout(d time.Duration) Option {
+	return func(o *Options) { o.PreparationTimeout = d }
+}
+
+// WithPayloadGCGrace sets the reachability-GC grace for released payloads.
+func WithPayloadGCGrace(d time.Duration) Option {
+	return func(o *Options) { o.PayloadGCGrace = d }
 }
 
 func randomWorkerID() string {
