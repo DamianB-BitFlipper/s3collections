@@ -1,5 +1,4 @@
-// treedemo demonstrates content-addressed blobs, immutable nodes, named refs,
-// lineage traversal, and leases using the in-memory backend.
+// treedemo shows content-addressed bodies and transactional tree metadata.
 package main
 
 import (
@@ -9,48 +8,42 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
-	"time"
 
-	"github.com/damianb/s3collections/s3backend"
+	"github.com/damianb/s3collections/storage"
 	"github.com/damianb/s3collections/tree"
 )
 
 func main() {
 	ctx := context.Background()
-	store, err := tree.New(s3backend.NewMemory(), "demo")
+	eng, err := storage.NewEngine(storage.NewMemoryKV(), storage.NewMemoryBlobStore())
 	if err != nil {
 		log.Fatal(err)
 	}
-	payload := bytes.Repeat([]byte("x"), 40<<10)
+	defer eng.Close()
+
+	store := tree.New(eng)
+	payload := []byte("release artifact")
 	sum := sha256.Sum256(payload)
-	ref, err := store.PutBlob(ctx, tree.BlobID(hex.EncodeToString(sum[:])), bytes.NewReader(payload), tree.WithExpectedBlobSize(int64(len(payload))))
+	manifest, err := store.PutBlob(ctx, hex.EncodeToString(sum[:]), bytes.NewReader(payload), tree.PutOptions{Key: "artifact", Size: int64(len(payload))})
 	if err != nil {
 		log.Fatal(err)
 	}
-	root, err := store.CommitRoot(ctx, []tree.BlobRef{ref}, []byte("opaque root metadata"))
+
+	node := tree.Node{Name: "release", Leaf: true, Blobs: []string{manifest.Hash}}
+	nodeID, err := store.PutNode(ctx, node)
 	if err != nil {
 		log.Fatal(err)
 	}
-	head, err := store.CreateRef(ctx, "branches/main", root)
+	head, err := store.CompareAndSwapRef(ctx, "main", nodeID, 0)
 	if err != nil {
 		log.Fatal(err)
 	}
-	child, err := store.CommitChild(ctx, root, nil, []byte("opaque child metadata"))
+	lease, err := store.AcquireLease(ctx, "publisher")
 	if err != nil {
 		log.Fatal(err)
 	}
-	head, err = store.CompareAndSwapRef(ctx, head.Name, head.Revision, child)
-	if err != nil {
+	if err := store.CheckFence(ctx, lease.Name, lease.Token); err != nil {
 		log.Fatal(err)
 	}
-	line, err := store.ResolveLineage(ctx, head.NodeID, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	lease, err := store.AcquireLease(ctx, head.NodeID, "demo-reader", time.Minute)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer store.ReleaseLease(ctx, lease)
-	fmt.Printf("head=%s revision=%d lineage=%d\n", head.NodeID, head.Revision, len(line))
+	fmt.Printf("head=%s version=%d blob=%s\n", head.NodeID, head.Version, manifest.Hash)
 }

@@ -1,15 +1,11 @@
-// Package s3collections provides distributed data structures backed solely
-// by S3: immutable blob and tree primitives (package tree), a versioned
-// compare-and-swap store (package cas), a distributed LRU metadata store
-// (package lru), and a durable work queue (package queue).
+// Package s3collections documents the shared model used by the collection
+// packages. Transactional metadata is accessed through storage.KV, normally
+// supplied by a storage.Engine. Large queue and tree bodies are streamed
+// through a separate storage.BlobStore owned by that engine.
 //
-// This root package defines the shared plumbing used by every component:
-// observability interfaces (Meter, Logger, Tracer), retry policy, and test
-// helpers. It has no third-party dependencies; the whole module uses only
-// the Go standard library.
-//
-// Consistency model (see docs/reference.md): every structure
-// relies only on strong read-after-write GET/LIST, atomic per-key PUT, and
-// conditional PUT (If-None-Match / If-Match). Single-key operations are
-// linearizable; cross-key invariants are best-effort with background repair.
+// The native engine uses the official SlateDB Go v0.15 binding and stores its
+// database on S3. A SlateDB database path has one writer process at a time;
+// fencing is a safety mechanism, not support for concurrent writers. Body
+// upload and metadata publication are separate operations, so deployments
+// must garbage-collect uploads that were never published after a grace period.
 package s3collections

@@ -10,19 +10,14 @@ import (
 	"time"
 
 	"github.com/damianb/s3collections/cas"
-	"github.com/damianb/s3collections/s3backend"
+	"github.com/damianb/s3collections/storage"
 )
 
 func main() {
 	ctx := context.Background()
-	be := s3backend.NewMemory()
-	store, err := cas.New(be, "demo/",
-		cas.WithWriterID("casdemo"),
-		cas.WithTombstoneRetention(5*time.Minute),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
+	kv := storage.NewMemoryKV()
+	defer kv.Close()
+	store := cas.New(kv, "demo/", cas.WithTombstoneRetention(5*time.Minute))
 
 	// Create a live record.
 	rec, err := store.Create(ctx, "config", []byte("v1"))
@@ -40,7 +35,7 @@ func main() {
 
 	// Simulate a concurrent writer using a stale revision.
 	_, err = store.CompareAndSwap(ctx, "config", rec.Revision-1, []byte("v2-stale"))
-	if !errors.Is(err, cas.ErrConflict) {
+	if !errors.Is(err, cas.ErrRevisionMismatch) {
 		log.Fatalf("expected conflict, got %v", err)
 	}
 	fmt.Println("detected stale revision conflict as expected")
@@ -67,7 +62,7 @@ func main() {
 	fmt.Println("get after delete returns ErrNotFound as expected")
 
 	// GC any eligible tombstones (none yet because retention has not passed).
-	n, err := store.GC(ctx, &cas.GCOptions{Prefix: "", MaxDeletes: 100})
+	n, err := store.GC(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}

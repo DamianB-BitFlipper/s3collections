@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  portable:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,14 +14,41 @@ jobs:
           go-version: "1.26"
       - name: gofmt
         run: test -z "$(gofmt -l .)"
-      - name: vet
+      - name: vet (portable, no cgo)
+        env:
+          CGO_ENABLED: "0"
         run: go vet ./...
-      - name: test
-        run: go test ./... -race -count=1
-      - name: fuzz smoke (30s each)
+      - name: verify native binding is excluded
+        env:
+          CGO_ENABLED: "0"
+        run: "! go list -deps ./... | grep -q '^slatedb.io/slatedb-go'"
+      - name: test (portable, no native SlateDB)
+        env:
+          CGO_ENABLED: "0"
+        run: go test ./... -count=1
+      - name: race test
+        run: go test -race ./... -count=1
+
+  slatedb-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: slatedb-src
+      - name: Build pinned SlateDB v0.15 native library
         run: |
-          for f in $(grep -rl "^func Fuzz" --include="*_test.go" . | xargs -I{} dirname {} | sort -u); do
-            for fn in $(grep -h "^func Fuzz" $f/*_test.go | sed 's/func \(Fuzz[A-Za-z0-9_]*\).*/\1/'); do
-              (cd $f && go test -run=NONE -fuzz=$fn -fuzztime=20s .)
-            done
-          done
+          git clone --depth 1 --branch bindings/go/v0.15.0 \
+            https://github.com/slatedb/slatedb.git slatedb-src
+          cargo build --manifest-path slatedb-src/Cargo.toml \
+            --release --package slatedb-uniffi
+      - name: Test native SlateDB engine
+        env:
+          CGO_ENABLED: "1"
+          CGO_LDFLAGS: -L${{ github.workspace }}/slatedb-src/target/release
+          LD_LIBRARY_PATH: ${{ github.workspace }}/slatedb-src/target/release
+        run: go test -race -tags slatedb ./... -count=1

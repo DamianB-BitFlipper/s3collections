@@ -1,16 +1,26 @@
-// Package tree implements five portable S3-backed primitive families:
-// content-addressed immutable blobs, content-addressed immutable node
-// manifests, revisioned named references, parent-authoritative topology, and
-// fenced leases with reachability garbage collection.
+// Package tree implements a deterministic, content-addressed Merkle tree
+// on top of storage.Engine.
 //
-// Blob bytes are stored raw and separately from their small metadata
-// manifests. Encoding and encryption descriptors are opaque bytes: this
-// package neither interprets nor transforms them. Application-specific
-// semantics deliberately remain outside this package.
+// Blobs are stored separately from metadata. Each blob lives in the
+// engine's BlobStore under an immutable unique object key, and a small
+// Manifest in the metadata KV records that object key, logical key, SHA-256,
+// and size. PutBlob streams content, verifies the caller-supplied expected
+// hash, and writes the manifest atomically after the blob lands.
 //
-// All durable coordination uses ordinary S3-compatible operations. The
-// package does not use append or write-offset extensions and works with AWS
-// general-purpose S3, Cloudflare R2, MinIO, and compatible implementations
-// that honor Backend's conditional-write contract. Reverse child edges are
-// advisory; only node parent pointers are authoritative.
+// Tree Nodes are deterministic: children and blob references are sorted
+// before hashing, so a node's ID is a pure function of its content and
+// identical trees always produce identical IDs. Nodes form a content
+// addressed DAG (the "graph"): leaf nodes reference blob hashes and
+// internal nodes reference child node IDs.
+//
+// Refs are named pointers to root node IDs, updated with compare-and-swap
+// on a monotonically increasing version inside a serializable transaction.
+// Leases carry fencing tokens. CompareAndSwapRefFenced and SweepGCFenced
+// validate the token inside the same serializable metadata transaction as
+// the protected mutation. CheckFence alone is advisory and must not guard a
+// later write across a process-ownership boundary.
+//
+// Garbage collection is reachability based: PlanGC walks the node graph
+// from every ref and returns the unreachable nodes and blobs, and SweepGC
+// deletes them.
 package tree
