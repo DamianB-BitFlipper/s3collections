@@ -9,20 +9,20 @@ import (
 	"time"
 
 	"github.com/damianb/s3collections/lru"
-	"github.com/damianb/s3collections/s3backend"
+	"github.com/damianb/s3collections/storage"
 )
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	be := s3backend.NewMemory()
-	store, err := lru.New(be, lru.Options{
+	kv := storage.NewMemoryKV()
+	defer kv.Close()
+	store, err := lru.New(kv, lru.Options{
 		ShardCount:      4,
 		CapacityItems:   1, // tiny cap so the evictor has work to do
 		EvictorInterval: 400 * time.Millisecond,
 		TouchOnGet:      false,
-		TombstoneMinAge: 24 * time.Hour,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -62,7 +62,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("before eviction: approxItems=%d\n", statsBefore.ApproxItems)
+	fmt.Printf("before eviction: approxItems=%d\n", statsBefore.Items)
 
 	// Wait for the CLOCK evictor to clear access bits and then evict.
 	time.Sleep(1 * time.Second)
@@ -79,6 +79,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("after eviction: found=%d approxItems=%d tombstones=%d\n",
-		found, stats.ApproxItems, stats.Tombstones)
+	fmt.Printf("after eviction: found=%d items=%d\n",
+		found, stats.Items)
 }

@@ -1,458 +1,521 @@
+// Package cas implements a versioned, compare-and-swap record store on top
+// of the storage.KV abstraction. It provides optimistic concurrency via
+// per-record revisions, soft deletes with tombstones, and a garbage
+// collector that reclaims expired tombstones.
 package cas
 
 import (
-	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
-	"strings"
+	"fmt"
+	"sort"
 	"time"
 
-	"github.com/damianb/s3collections"
-	"github.com/damianb/s3collections/s3backend"
+	"github.com/damianb/s3collections/storage"
 )
 
-// Store is a versioned compare-and-swap store over S3.
+// State describes the lifecycle state of a Record.
+type State string
+
+const (
+	// StateLive marks a record that holds a current value.
+	StateLive State = "live"
+	// StateTombstone marks a deleted record whose metadata is retained
+	// until garbage collection reclaims it.
+	StateTombstone State = "tombstone"
+)
+
+// Sentinel errors returned by the CAS store.
+var (
+	// ErrNotFound is returned when a key has no record, or only an
+	// expired tombstone, in the store.
+	ErrNotFound = errors.New("cas: not found")
+	// ErrExists is returned by Create when a live record already exists
+	// for the key.
+	ErrExists = errors.New("cas: already exists")
+	// ErrDeleted is returned when an operation requires a live record
+	// but the record is a tombstone.
+	ErrDeleted = errors.New("cas: record is deleted")
+	// ErrRevisionMismatch is returned when an expected revision does not
+	// match the stored revision.
+	ErrRevisionMismatch = errors.New("cas: revision mismatch")
+	// ErrConflict is an alias used for stale revisions and exhausted storage conflicts.
+	ErrConflict = ErrRevisionMismatch
+	// ErrValueTooLarge is returned when a value exceeds the configured
+	// maximum value size.
+	ErrValueTooLarge = errors.New("cas: value too large")
+	// ErrEmptyKey is returned when a key is empty.
+	ErrEmptyKey = errors.New("cas: empty key")
+)
+
+// Record is a versioned key/value entry.
+type Record struct {
+	Key       string    `json:"key"`
+	Value     []byte    `json:"value,omitempty"`
+	Revision  uint64    `json:"revision"`
+	State     State     `json:"state"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	// DeletedAt is set when the record becomes a tombstone.
+	DeletedAt time.Time `json:"deleted_at,omitempty"`
+}
+
+// Option configures a Store.
+type Option func(*Store)
+
+// WithMaxValueBytes caps the size of values accepted by mutating
+// operations. n <= 0 disables the limit; the default is 512 KiB.
+func WithMaxValueBytes(n int64) Option {
+	return func(s *Store) { s.maxValueBytes = n }
+}
+
+// WithTombstoneRetention sets how long tombstones are kept before GC may
+// remove them. d <= 0 means tombstones are kept forever (the default).
+func WithTombstoneRetention(d time.Duration) Option {
+	return func(s *Store) { s.retention = d }
+}
+
+// WithAllowResurrection allows Create to revive a tombstoned key.
+func WithAllowResurrection(allow bool) Option {
+	return func(s *Store) { s.allowResurrection = allow }
+}
+
+// Store is a versioned record store backed by a storage.KV.
 type Store struct {
-	backend s3backend.Backend
-	prefix  string
-	opts    Options
+	kv                storage.KV
+	prefix            string
+	maxValueBytes     int64
+	retention         time.Duration
+	allowResurrection bool
+	now               func() time.Time
 }
 
-// New creates a Store backed by b with the given object key prefix.
-// Prefix may be empty or end with '/'.
-func New(b s3backend.Backend, prefix string, opts ...Option) (*Store, error) {
-	if b == nil {
-		return nil, errors.New("cas: nil backend")
+// New creates a Store on kv. All record keys are namespaced under prefix.
+func New(kv storage.KV, prefix string, opts ...Option) *Store {
+	s := &Store{
+		kv:            kv,
+		prefix:        prefix,
+		maxValueBytes: 512 << 10,
+		now:           func() time.Time { return time.Now().UTC() },
 	}
-	if strings.Contains(prefix, "//") {
-		return nil, errors.New("cas: prefix contains back-to-back slashes")
-	}
-	var o Options
 	for _, opt := range opts {
-		opt(&o)
+		opt(s)
 	}
-	applyDefaults(&o)
-	if o.KeyCodec == nil {
-		o.KeyCodec = newPrefixKeyCodec(prefix)
-	}
-	o.Meter = s3collections.MeterOrNoop(o.Meter)
-	o.Logger = s3collections.LoggerOrNoop(o.Logger)
-	o.Tracer = s3collections.TracerOrNoop(o.Tracer)
-	return &Store{
-		backend: b,
-		prefix:  prefix,
-		opts:    o,
-	}, nil
+	return s
 }
 
-// objectKey returns the full S3 object key for an application key.
-func (s *Store) objectKey(appKey string) (string, error) {
-	return s.opts.KeyCodec.Encode(appKey)
+// encodeKey maps an arbitrary user key to a storage-safe key using
+// URL-safe base64 without padding.
+func (s *Store) storagePrefix() string {
+	return "cas/" + base64.RawURLEncoding.EncodeToString([]byte(s.prefix)) + "/"
 }
 
-// readRecord fetches and parses the envelope for appKey.
-// It returns the parsed envelope, backend object metadata, and a public Record.
-func (s *Store) readRecord(ctx context.Context, appKey string) (*envelope, *s3backend.Object, Record, error) {
-	objKey, err := s.objectKey(appKey)
-	if err != nil {
-		return nil, nil, Record{}, err
-	}
-	obj, err := s.backend.Get(ctx, objKey)
-	if err != nil {
-		return nil, nil, Record{}, classifyError(opGet, err)
-	}
-	e, err := parseEnvelope(obj.Body, appKey)
-	if err != nil {
-		s.recordCorrupt(ctx)
-		return nil, nil, Record{}, err
-	}
-	rec := recordFromEnvelope(e, obj.ETag)
-	return e, obj, rec, nil
+func (s *Store) encodeKey(key string) string {
+	return s.storagePrefix() + base64.RawURLEncoding.EncodeToString([]byte(key))
 }
 
-// Create creates a new live record only if no object exists.
-func (s *Store) Create(ctx context.Context, key string, value []byte, opts ...WriteOption) (Record, error) {
-	start := time.Now()
-	wopts := applyWriteDefaults(opts, &s.opts)
-	defer s.recordAttempts(ctx, opCreate, 1)
-
-	if len(value) > s.opts.MaxValueBytes {
-		s.observeLatency(ctx, opCreate, start, outcomeError)
-		return Record{}, ErrTooLarge
-	}
-	objKey, err := s.objectKey(key)
+// decodeKey maps a storage key back to the user key.
+func (s *Store) decodeKey(storageKey string) (string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(storageKey[len(s.storagePrefix()):])
 	if err != nil {
-		s.observeLatency(ctx, opCreate, start, outcomeError)
-		return Record{}, err
+		return "", err
 	}
-	now := time.Now().UTC()
-	body, err := marshalEnvelope(key, 1, Live, value, now, now, time.Time{}, s.opts.WriterID)
-	if err != nil {
-		s.observeLatency(ctx, opCreate, start, outcomeError)
-		return Record{}, err
-	}
-
-	var rec Record
-	err = s.runWithRetry(ctx, opCreate, *wopts.Retry, func(ctx context.Context) error {
-		etag, err := s.backend.Put(ctx, objKey, body, &s3backend.Preconditions{IfNoneMatch: true})
-		if err != nil {
-			return classifyError(opCreate, err)
-		}
-		rec = Record{
-			Key:       key,
-			Value:     value,
-			Revision:  1,
-			State:     Live,
-			CreatedAt: now,
-			UpdatedAt: now,
-			WriterID:  s.opts.WriterID,
-			ETag:      etag,
-		}
-		return nil
-	})
-	if err != nil {
-		s.observeLatency(ctx, opCreate, start, outcomeFor(err))
-		return Record{}, err
-	}
-	s.observeLatency(ctx, opCreate, start, outcomeSuccess)
-	return rec, nil
+	return string(raw), nil
 }
 
-// Get returns the live record for key. Tombstones and missing keys return ErrNotFound.
-func (s *Store) Get(ctx context.Context, key string) (Record, error) {
-	start := time.Now()
-	defer s.recordAttempts(ctx, opGet, 1)
-
-	objKey, err := s.objectKey(key)
-	if err != nil {
-		s.observeLatency(ctx, opGet, start, outcomeError)
-		return Record{}, err
-	}
-	var (
-		e   *envelope
-		obj *s3backend.Object
-	)
-	err = s.runWithRetry(ctx, opGet, s.opts.Retry, func(ctx context.Context) error {
-		var err error
-		obj, err = s.backend.Get(ctx, objKey)
-		if err != nil {
-			return classifyError(opGet, err)
-		}
-		e, err = parseEnvelope(obj.Body, key)
-		if err != nil {
-			s.recordCorrupt(ctx)
-			return err
-		}
-		return nil
-	})
-	if err != nil {
-		s.observeLatency(ctx, opGet, start, outcomeFor(err))
-		return Record{}, err
-	}
-	rec := recordFromEnvelope(e, obj.ETag)
-	if rec.State == Tombstone {
-		err := &NotFoundError{
-			Key:        key,
-			Tombstoned: true,
-			Revision:   rec.Revision,
-			DeletedAt:  rec.DeletedAt,
-		}
-		s.observeLatency(ctx, opGet, start, outcomeError)
-		return Record{}, err
-	}
-	s.observeLatency(ctx, opGet, start, outcomeSuccess)
-	return rec, nil
-}
-
-// GetMeta returns metadata even for tombstones.
-func (s *Store) GetMeta(ctx context.Context, key string) (Record, error) {
-	start := time.Now()
-	defer s.recordAttempts(ctx, opGet, 1)
-
-	objKey, err := s.objectKey(key)
-	if err != nil {
-		s.observeLatency(ctx, opGet, start, outcomeError)
-		return Record{}, err
-	}
-	var (
-		e   *envelope
-		obj *s3backend.Object
-	)
-	err = s.runWithRetry(ctx, opGet, s.opts.Retry, func(ctx context.Context) error {
-		var err error
-		obj, err = s.backend.Get(ctx, objKey)
-		if err != nil {
-			return classifyError(opGet, err)
-		}
-		e, err = parseEnvelope(obj.Body, key)
-		if err != nil {
-			s.recordCorrupt(ctx)
-			return err
-		}
-		return nil
-	})
-	if err != nil {
-		s.observeLatency(ctx, opGet, start, outcomeFor(err))
-		return Record{}, err
-	}
-	rec := recordFromEnvelope(e, obj.ETag)
-	s.observeLatency(ctx, opGet, start, outcomeSuccess)
-	return rec, nil
-}
-
-// CompareAndSwap replaces the value iff the current live revision equals expect.
-func (s *Store) CompareAndSwap(ctx context.Context, key string, expect uint64, newValue []byte, opts ...WriteOption) (Record, error) {
-	start := time.Now()
-	wopts := applyWriteDefaults(opts, &s.opts)
-
-	if len(newValue) > s.opts.MaxValueBytes {
-		s.observeLatency(ctx, opCAS, start, outcomeError)
-		return Record{}, ErrTooLarge
-	}
-
-	var rec Record
-	attempts := 0
-	err := s.runWithRetry(ctx, opCAS, *wopts.Retry, func(ctx context.Context) error {
-		attempts++
-		e, obj, cur, err := s.readRecord(ctx, key)
-		if err != nil {
-			if errors.Is(err, ErrNotFound) {
-				return err
-			}
-			return err
-		}
-		if cur.State == Tombstone {
-			return ErrDeleted
-		}
-		if cur.Revision != expect {
-			return ErrConflict
-		}
-		now := time.Now().UTC()
-		body, err := marshalEnvelope(key, e.Rev+1, Live, newValue, e.CreatedAt, now, time.Time{}, s.opts.WriterID)
-		if err != nil {
-			return err
-		}
-		etag, err := s.backend.Put(ctx, obj.Key, body, &s3backend.Preconditions{IfMatchETag: obj.ETag})
-		if err != nil {
-			return classifyError(opCAS, err)
-		}
-		rec = Record{
-			Key:       key,
-			Value:     newValue,
-			Revision:  e.Rev + 1,
-			State:     Live,
-			CreatedAt: e.CreatedAt,
-			UpdatedAt: now,
-			WriterID:  s.opts.WriterID,
-			ETag:      etag,
-		}
-		return nil
-	})
-	s.recordAttempts(ctx, opCAS, attempts)
-	if err != nil {
-		s.observeLatency(ctx, opCAS, start, outcomeFor(err))
-		return Record{}, err
-	}
-	s.observeLatency(ctx, opCAS, start, outcomeSuccess)
-	return rec, nil
-}
-
-// Update performs a read-modify-write loop.
-func (s *Store) Update(ctx context.Context, key string, fn UpdateFn, opts ...WriteOption) (Record, error) {
-	start := time.Now()
-	wopts := applyWriteDefaults(opts, &s.opts)
-
-	var rec Record
-	attempts := 0
-	err := s.runWithRetry(ctx, opUpdate, *wopts.Retry, func(ctx context.Context) error {
-		attempts++
-		e, obj, cur, err := s.readRecord(ctx, key)
-		if err != nil {
-			return err
-		}
-
-		var next []byte
-		if cur.State == Tombstone {
-			if !wopts.IncludeTombstone {
-				return ErrDeleted
-			}
-			next, err = fn(ctx, cur)
-			if err != nil {
-				return err
-			}
-			if next == nil {
-				rec = cur
-				return nil
-			}
-			if !wopts.Resurrect {
-				return ErrDeleted
-			}
-			now := time.Now().UTC()
-			body, merr := marshalEnvelope(key, e.Rev+1, Live, next, e.CreatedAt, now, time.Time{}, s.opts.WriterID)
-			if merr != nil {
-				return merr
-			}
-			etag, perr := s.backend.Put(ctx, obj.Key, body, &s3backend.Preconditions{IfMatchETag: obj.ETag})
-			if perr != nil {
-				return classifyError(opUpdate, perr)
-			}
-			rec = Record{
-				Key:       key,
-				Value:     next,
-				Revision:  e.Rev + 1,
-				State:     Live,
-				CreatedAt: e.CreatedAt,
-				UpdatedAt: now,
-				WriterID:  s.opts.WriterID,
-				ETag:      etag,
-			}
-			return nil
-		}
-
-		// Live state.
-		next, err = fn(ctx, cur)
-		if err != nil {
-			return err
-		}
-		if next == nil || bytes.Equal(next, cur.Value) {
-			rec = cur
-			return nil
-		}
-		if len(next) > s.opts.MaxValueBytes {
-			return ErrTooLarge
-		}
-		now := time.Now().UTC()
-		body, merr := marshalEnvelope(key, e.Rev+1, Live, next, e.CreatedAt, now, time.Time{}, s.opts.WriterID)
-		if merr != nil {
-			return merr
-		}
-		etag, perr := s.backend.Put(ctx, obj.Key, body, &s3backend.Preconditions{IfMatchETag: obj.ETag})
-		if perr != nil {
-			return classifyError(opUpdate, perr)
-		}
-		rec = Record{
-			Key:       key,
-			Value:     next,
-			Revision:  e.Rev + 1,
-			State:     Live,
-			CreatedAt: e.CreatedAt,
-			UpdatedAt: now,
-			WriterID:  s.opts.WriterID,
-			ETag:      etag,
-		}
-		return nil
-	})
-	s.recordAttempts(ctx, opUpdate, attempts)
-	if err != nil {
-		s.observeLatency(ctx, opUpdate, start, outcomeFor(err))
-		return Record{}, err
-	}
-	s.observeLatency(ctx, opUpdate, start, outcomeSuccess)
-	return rec, nil
-}
-
-// Delete writes a tombstone envelope.
-func (s *Store) Delete(ctx context.Context, key string, expect uint64, opts ...WriteOption) (Record, error) {
-	start := time.Now()
-	wopts := applyWriteDefaults(opts, &s.opts)
-
-	var rec Record
-	attempts := 0
-	err := s.runWithRetry(ctx, opDelete, *wopts.Retry, func(ctx context.Context) error {
-		attempts++
-		e, obj, cur, err := s.readRecord(ctx, key)
-		if err != nil {
-			return err
-		}
-		if cur.State == Tombstone {
-			if expect == cur.Revision || expect == cur.Revision-1 {
-				rec = cur
-				return nil
-			}
-			return ErrConflict
-		}
-		if cur.Revision != expect {
-			return ErrConflict
-		}
-		now := time.Now().UTC()
-		body, merr := marshalEnvelope(key, e.Rev+1, Tombstone, nil, e.CreatedAt, now, now, s.opts.WriterID)
-		if merr != nil {
-			return merr
-		}
-		etag, perr := s.backend.Put(ctx, obj.Key, body, &s3backend.Preconditions{IfMatchETag: obj.ETag})
-		if perr != nil {
-			return classifyError(opDelete, perr)
-		}
-		rec = Record{
-			Key:       key,
-			Revision:  e.Rev + 1,
-			State:     Tombstone,
-			CreatedAt: e.CreatedAt,
-			UpdatedAt: now,
-			DeletedAt: now,
-			WriterID:  s.opts.WriterID,
-			ETag:      etag,
-		}
-		return nil
-	})
-	s.recordAttempts(ctx, opDelete, attempts)
-	if err != nil {
-		s.observeLatency(ctx, opDelete, start, outcomeFor(err))
-		return Record{}, err
-	}
-	s.observeLatency(ctx, opDelete, start, outcomeSuccess)
-	return rec, nil
-}
-
-// runWithRetry executes op with the given retry policy, classifying transient and conflict errors.
-func (s *Store) runWithRetry(ctx context.Context, op opName, policy s3collections.RetryPolicy, opFn func(context.Context) error) error {
-	policy = policy.WithDefaults()
-	nextDelay := s3collections.BackoffDelays(policy, nil)
-	for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
-		err := opFn(ctx)
-		if err == nil {
-			return nil
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		// Classified conflict errors are not retried automatically by this loop
-		// unless they are backend precondition failures. We retry on ErrConflict
-		// only for update-style operations; for create/delete/cas the caller loop is
-		// not used, but the policy still applies to backend retries.
-		switch {
-		case errors.Is(err, ErrConflict):
-			s.recordConflict(ctx, op)
-			if op != opUpdate {
-				return err
-			}
-			// Update retries on conflict after re-reading and re-invoking fn.
-		case errors.Is(err, ErrAlreadyExists), errors.Is(err, ErrNotFound), errors.Is(err, ErrDeleted), errors.Is(err, ErrTooLarge):
-			return err
-		case s3backend.IsRetryable(err):
-			s.recordRetry(ctx, op, "backend")
-		default:
-			return err
-		}
-		if attempt == policy.MaxAttempts {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(nextDelay()):
-		}
+func (s *Store) checkValue(value []byte) error {
+	if s.maxValueBytes > 0 && int64(len(value)) > s.maxValueBytes {
+		return fmt.Errorf("%w: %d > %d", ErrValueTooLarge, len(value), s.maxValueBytes)
 	}
 	return nil
 }
 
-// outcomeFor maps an error to a metric outcome label.
-func outcomeFor(err error) string {
-	if err == nil {
-		return outcomeSuccess
+func getRecord(tx storage.Tx, storageKey string) (Record, bool, error) {
+	raw, err := tx.Get(storageKey)
+	if errors.Is(err, storage.ErrNotFound) {
+		return Record{}, false, nil
 	}
-	if errors.Is(err, ErrConflict) || errors.Is(err, ErrAlreadyExists) {
-		return outcomeConflict
+	if err != nil {
+		return Record{}, false, err
 	}
-	return outcomeError
+	var rec Record
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return Record{}, false, fmt.Errorf("cas: decode record: %w", err)
+	}
+	return rec, true, nil
+}
+
+func putRecord(tx storage.Tx, storageKey string, rec Record) error {
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("cas: encode record: %w", err)
+	}
+	return tx.Put(storageKey, raw)
+}
+
+// transact runs fn in a transaction, retrying on serialization conflicts.
+func (s *Store) transact(ctx context.Context, fn func(storage.Tx) error) error {
+	const maxAttempts = 16
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := s.kv.Transaction(ctx, fn)
+		if !errors.Is(err, storage.ErrConflict) {
+			return err
+		}
+	}
+	return ErrConflict
+}
+
+// Create inserts a new live record with revision 1. It fails with
+// ErrExists if a live record exists for key, and with ErrDeleted if the
+// record is a tombstone and resurrection is not allowed.
+func (s *Store) Create(ctx context.Context, key string, value []byte) (Record, error) {
+	if key == "" {
+		return Record{}, ErrEmptyKey
+	}
+	if err := s.checkValue(value); err != nil {
+		return Record{}, err
+	}
+	skey := s.encodeKey(key)
+	var out Record
+	err := s.transact(ctx, func(tx storage.Tx) error {
+		rec, found, err := getRecord(tx, skey)
+		if err != nil {
+			return err
+		}
+		now := s.now()
+		if found {
+			if rec.State == StateLive {
+				return ErrExists
+			}
+			if !s.allowResurrection {
+				return ErrDeleted
+			}
+			// Resurrect: keep history, bump revision.
+			out = Record{
+				Key:       key,
+				Value:     clone(value),
+				Revision:  rec.Revision + 1,
+				State:     StateLive,
+				CreatedAt: rec.CreatedAt,
+				UpdatedAt: now,
+			}
+		} else {
+			out = Record{
+				Key:       key,
+				Value:     clone(value),
+				Revision:  1,
+				State:     StateLive,
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+		}
+		return putRecord(tx, skey, out)
+	})
+	if err != nil {
+		return Record{}, err
+	}
+	return out, nil
+}
+
+// Get returns the live record for key, including its value.
+func (s *Store) Get(ctx context.Context, key string) (Record, error) {
+	return s.get(ctx, key, true)
+}
+
+// GetMeta returns record metadata for live records and tombstones. The
+// returned Record has Value cleared.
+func (s *Store) GetMeta(ctx context.Context, key string) (Record, error) {
+	return s.get(ctx, key, false)
+}
+
+func (s *Store) get(ctx context.Context, key string, withValue bool) (Record, error) {
+	if key == "" {
+		return Record{}, ErrEmptyKey
+	}
+	raw, err := s.kv.Get(ctx, s.encodeKey(key))
+	if errors.Is(err, storage.ErrNotFound) {
+		return Record{}, ErrNotFound
+	}
+	if err != nil {
+		return Record{}, err
+	}
+	var rec Record
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return Record{}, fmt.Errorf("cas: decode record: %w", err)
+	}
+	if rec.State == StateTombstone && withValue {
+		return Record{}, ErrNotFound
+	}
+	if !withValue {
+		rec.Value = nil
+	}
+	return rec, nil
+}
+
+// CompareAndSwap replaces the value of the live record at key only if its
+// current revision equals expect. It returns the updated record.
+func (s *Store) CompareAndSwap(ctx context.Context, key string, expect uint64, value []byte) (Record, error) {
+	if key == "" {
+		return Record{}, ErrEmptyKey
+	}
+	if err := s.checkValue(value); err != nil {
+		return Record{}, err
+	}
+	skey := s.encodeKey(key)
+	var out Record
+	err := s.transact(ctx, func(tx storage.Tx) error {
+		rec, found, err := getRecord(tx, skey)
+		if err != nil {
+			return err
+		}
+		if !found || rec.State == StateTombstone {
+			return ErrNotFound
+		}
+		if rec.Revision != expect {
+			return ErrRevisionMismatch
+		}
+		if equal(rec.Value, value) {
+			// No-op update: do not bump the revision.
+			out = rec
+			return nil
+		}
+		out = rec
+		out.Value = clone(value)
+		out.Revision = rec.Revision + 1
+		out.UpdatedAt = s.now()
+		return putRecord(tx, skey, out)
+	})
+	if err != nil {
+		return Record{}, err
+	}
+	return out, nil
+}
+
+// Update applies fn to the current live record at key and stores the
+// returned value. fn may run more than once when a transaction conflicts and
+// must not perform external side effects. If fn returns a value identical to the current one, the
+// revision is not bumped.
+func (s *Store) Update(ctx context.Context, key string, fn func(ctx context.Context, rec Record) ([]byte, error)) (Record, error) {
+	if key == "" {
+		return Record{}, ErrEmptyKey
+	}
+	if fn == nil {
+		return Record{}, errors.New("cas: nil update function")
+	}
+	skey := s.encodeKey(key)
+	var out Record
+	err := s.transact(ctx, func(tx storage.Tx) error {
+		rec, found, err := getRecord(tx, skey)
+		if err != nil {
+			return err
+		}
+		if !found || rec.State == StateTombstone {
+			return ErrNotFound
+		}
+		newValue, err := fn(ctx, rec)
+		if err != nil {
+			return err
+		}
+		if err := s.checkValue(newValue); err != nil {
+			return err
+		}
+		if equal(rec.Value, newValue) {
+			// No-op update: do not bump the revision.
+			out = rec
+			return nil
+		}
+		out = rec
+		out.Value = clone(newValue)
+		out.Revision = rec.Revision + 1
+		out.UpdatedAt = s.now()
+		return putRecord(tx, skey, out)
+	})
+	if err != nil {
+		return Record{}, err
+	}
+	return out, nil
+}
+
+// Delete converts the live record at key into a tombstone, but only if
+// its current revision equals expect. A zero expect deletes any revision.
+func (s *Store) Delete(ctx context.Context, key string, expect uint64) (Record, error) {
+	if key == "" {
+		return Record{}, ErrEmptyKey
+	}
+	skey := s.encodeKey(key)
+	var out Record
+	err := s.transact(ctx, func(tx storage.Tx) error {
+		rec, found, err := getRecord(tx, skey)
+		if err != nil {
+			return err
+		}
+		if !found || rec.State == StateTombstone {
+			return ErrNotFound
+		}
+		if expect != 0 && rec.Revision != expect {
+			return ErrRevisionMismatch
+		}
+		now := s.now()
+		out = rec
+		out.Value = nil
+		out.State = StateTombstone
+		out.Revision = rec.Revision + 1
+		out.UpdatedAt = now
+		out.DeletedAt = now
+		return putRecord(tx, skey, out)
+	})
+	if err != nil {
+		return Record{}, err
+	}
+	return out, nil
+}
+
+// ListOptions controls a List call.
+type ListOptions struct {
+	// Prefix restricts results to records whose key has this prefix.
+	Prefix string
+	// StartAfter makes the listing begin strictly after this user key.
+	StartAfter string
+	// Limit caps the number of returned records; <= 0 means no limit.
+	Limit int
+	// IncludeTombstones includes tombstoned records in the result.
+	IncludeTombstones bool
+}
+
+// Page is a page of records from List.
+type Page struct {
+	Records []Record
+	// NextStartAfter is the user key to pass as ListOptions.StartAfter to
+	// fetch the next page. It is empty when the listing is exhausted.
+	NextStartAfter string
+}
+
+// List returns records in ascending byte-lexicographic user-key order.
+func (s *Store) List(ctx context.Context, opts ListOptions) (Page, error) {
+	entries, err := s.kv.Scan(ctx, storage.ScanOptions{Prefix: s.storagePrefix()})
+	if err != nil {
+		return Page{}, err
+	}
+	records := make([]Record, 0, len(entries))
+	for _, entry := range entries {
+		userKey, err := s.decodeKey(entry.Key)
+		if err != nil {
+			return Page{}, fmt.Errorf("cas: decode key: %w", err)
+		}
+		if opts.Prefix != "" && !hasPrefix(userKey, opts.Prefix) {
+			continue
+		}
+		if opts.StartAfter != "" && userKey <= opts.StartAfter {
+			continue
+		}
+		var record Record
+		if err := json.Unmarshal(entry.Value, &record); err != nil {
+			return Page{}, fmt.Errorf("cas: decode record: %w", err)
+		}
+		if record.State == StateTombstone && !opts.IncludeTombstones {
+			continue
+		}
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].Key < records[j].Key })
+	page := Page{}
+	if opts.Limit > 0 && len(records) > opts.Limit {
+		page.Records = records[:opts.Limit]
+		page.NextStartAfter = page.Records[len(page.Records)-1].Key
+		return page, nil
+	}
+	page.Records = records
+	return page, nil
+}
+
+func lastKey(recs []Record) string {
+	if len(recs) == 0 {
+		return ""
+	}
+	return recs[len(recs)-1].Key
+}
+
+// GC removes tombstones whose DeletedAt is older than the configured
+// retention. It returns the number of tombstones removed. If no positive
+// retention is configured, GC removes nothing and returns 0.
+func (s *Store) GC(ctx context.Context) (int, error) {
+	if s.retention <= 0 {
+		return 0, nil
+	}
+	entries, err := s.kv.Scan(ctx, storage.ScanOptions{Prefix: s.storagePrefix()})
+	if err != nil {
+		return 0, err
+	}
+	cutoff := s.now().Add(-s.retention)
+	var expired []string
+	for _, e := range entries {
+		var rec Record
+		if err := json.Unmarshal(e.Value, &rec); err != nil {
+			return 0, fmt.Errorf("cas: decode record: %w", err)
+		}
+		if rec.State == StateTombstone && !rec.DeletedAt.IsZero() && rec.DeletedAt.Before(cutoff) {
+			expired = append(expired, e.Key)
+		}
+	}
+	removed := 0
+	for _, skey := range expired {
+		didRemove := false
+		err := s.transact(ctx, func(tx storage.Tx) error {
+			didRemove = false
+			rec, found, err := getRecord(tx, skey)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return nil // already gone
+			}
+			// Re-check expiry inside the transaction: the record may have
+			// been resurrected since the scan.
+			if rec.State != StateTombstone || rec.DeletedAt.IsZero() || !rec.DeletedAt.Before(cutoff) {
+				return nil
+			}
+			if err := tx.Delete(skey); err != nil {
+				return err
+			}
+			didRemove = true
+			return nil
+		})
+		if err != nil {
+			return removed, err
+		}
+		if didRemove {
+			removed++
+		}
+	}
+	return removed, nil
+}
+
+func clone(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
+}
+
+func equal(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func hasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }

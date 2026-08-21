@@ -1,12 +1,15 @@
-// Package lru implements a distributed LRU metadata store backed by S3.
+// Package lru implements a deterministic least-recently-used metadata
+// store on top of storage.KV.
 //
-// The Store shards entries across a configurable number of keys, tracks live
-// bytes/items, and runs background CLOCK eviction workers. It is built on
-// package cas and therefore inherits strong read-after-write and conditional-
-// write guarantees without relying on any centralized hot key.
+// Entries carry a small JSON-encoded metadata record (size, creation
+// time, last-access time) and a monotonically increasing revision that is
+// bumped transactionally on every mutation. Keys are hashed into a fixed
+// number of shards under a configurable prefix so scans stay bounded and
+// eviction order is deterministic: the entry with the oldest
+// LastAccessAt (ties broken by key) is evicted first.
 //
-// Set resurrects tombstoned entries using cas.Update(..., cas.WithResurrect()).
-// Physical tombstone deletion is controlled by Options.TombstoneMinAge; the
-// default is 24 hours and should be chosen much larger than the expected S3
-// round-trip time to avoid losing freshly resurrected entries.
+// Capacity (bytes and/or item count) is soft: writes are never rejected,
+// and a background evictor trims the store back under the configured
+// limits. Close stops only the store's own goroutines; it never closes
+// the underlying KV.
 package lru
